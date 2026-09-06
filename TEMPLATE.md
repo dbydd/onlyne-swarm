@@ -15,8 +15,8 @@
 
 ```jsonc
 {
-  // 编辑器提示，指向仓库根的 template.workspace.schema.json；调度器忽略
-  "$schema": "../../../../../template.workspace.schema.json",
+  // 编辑器提示，指向 GitHub 上的 template.workspace.schema.json；调度器忽略
+  "$schema": "https://raw.githubusercontent.com/dbydd/onlyne-swarm/main/template.workspace.schema.json",
   // workspace 名，缺省取目录名
   "name": "planner",
   // 系统提示词，内联写进 jsonc（.roles/ 目录已删除，不再约定 md 格式）

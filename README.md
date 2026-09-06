@@ -66,7 +66,7 @@ Example template:
 
 ```jsonc
 {
-  "$schema": "../../../../../template.workspace.schema.json",
+  "$schema": "https://raw.githubusercontent.com/dbydd/onlyne-swarm/main/template.workspace.schema.json",
   "name": "reviewer",
   "role": "Review the incoming task and return a concise result.",
   "model": {

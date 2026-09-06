@@ -59,7 +59,7 @@ Full starter keys: `$schema`, `name`, `role`, `model`, `back_edges`.
 
 ```jsonc
 {
-  "$schema": "../../../../../template.workspace.schema.json",
+  "$schema": "https://raw.githubusercontent.com/dbydd/onlyne-swarm/main/template.workspace.schema.json",
   "name": "planner",
   "role": "You are the planner. Return a concise result.",
   "model": { "provider": "", "model": "", "effort": "" },
@@ -77,7 +77,7 @@ Rules:
 - Ancestor templates contribute scalar fields only; `back_edges` never inherit.
 - Hand-tune one instance in
   `_onlyne_workspaces/<path>/.onlyne/swarm.workspace.jsonc`; sync keeps it.
-- Validate templates against `template.workspace.schema.json`.
+- Validate templates against the GitHub-hosted `template.workspace.schema.json`.
 
 ## Generate and inspect the tree
 

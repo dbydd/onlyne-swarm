@@ -45,7 +45,7 @@ pub const ROOT_TEMPLATE: &str = r#"{
   // Full starter template. Every key ships with its default; delete
   // anything unchanged. Editors should resolve $schema against the
   // repository copy at the onlyne-swarm repo root.
-  "$schema": "../../../../../template.workspace.schema.json",
+  "$schema": "https://raw.githubusercontent.com/dbydd/onlyne-swarm/main/template.workspace.schema.json",
   // Workspace name. Defaults to the template directory name when empty.
   "name": "planner",
   // Inline system prompt delivered to the session before the task payload.
@@ -61,7 +61,7 @@ pub const ROOT_TEMPLATE: &str = r#"{
 pub const ROOT_WORKSPACE_JSONC: &str = r#"{
   // Root workspace description. Merged as the base layer for every
   // generated agent workspace. Keep shared role/model defaults here.
-  "$schema": "../../template.workspace.schema.json",
+  "$schema": "https://raw.githubusercontent.com/dbydd/onlyne-swarm/main/template.workspace.schema.json",
   "name": ".",
   "role": "",
   "model": { "provider": "", "model": "", "effort": "" },

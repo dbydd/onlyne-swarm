@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/dbydd/onlyne-swarm/blob/main/template.workspace.schema.json",
+  "$id": "https://raw.githubusercontent.com/dbydd/onlyne-swarm/main/template.workspace.schema.json",
   "title": "onlyne-swarm workspace template",
   "description": "Full starter template for .agents/.schedule/<name>/template.workspace.jsonc. Every key ships with its default; delete anything unchanged.",
   "type": "object",
