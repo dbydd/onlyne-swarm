@@ -29,14 +29,36 @@ fn run_json(mut cmd: Command) -> anyhow::Result<Value> {
 /// `env_task` is exported as ONLYNE_SWARM_TASK so pi-onlyne swarm mode can
 /// correlate; the actual task bytes are delivered later via loopback/in
 /// after `swarm_ready` (avoids create-vs-write races).
+///
+/// `SWARM_PI_EXT` env (scheduler side) optionally prepends `-e <path>` args
+/// so e2e trees can load a local pi-onlyne build instead of the global one.
+/// Stub hook for headless e2e: when `SWARM_STUB_AGENT=1`, no orca terminal
+/// is created. Instead a fake handle is returned and the test harness is
+/// expected to drive `swarm_ready` + task reply itself (see TEST.md).
 pub fn create(title: &str, cwd: &std::path::Path, env_task: &str) -> anyhow::Result<Terminal> {
+    if std::env::var("SWARM_STUB_AGENT").as_deref() == Ok("1") {
+        return Ok(Terminal {
+            handle: format!("stub-{title}-{env_task}"),
+        });
+    }
     let mut cmd = orca();
     cmd.args(["terminal", "create", "--title", title, "--command"]);
     // Escape for sh -c style consumption: orca runs the string in a shell.
+    let ext = std::env::var("SWARM_PI_EXT").unwrap_or_default();
+    // -ne disables global extension discovery so the -e local build does
+    // not collide with the globally installed pi-onlyne. Without SWARM_PI_EXT
+    // the plain global `pi` (with its own extensions) is used.
+    let (ne, ext_args) = if ext.trim().is_empty() {
+        (String::new(), String::new())
+    } else {
+        (" -ne".to_string(), format!(" -e {}", shell_escape(&ext)))
+    };
     let sh = format!(
-        "cd {} && ONLYNE_SWARM_TASK={} pi",
+        "cd {} && ONLYNE_SWARM_TASK={} pi{}{}",
         shell_escape(&cwd.to_string_lossy()),
-        shell_escape(env_task)
+        shell_escape(env_task),
+        ne,
+        ext_args
     );
     cmd.arg(sh);
     let v = run_json(cmd)?;

@@ -64,6 +64,10 @@ fn route_event(
     }
     let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    // Event lines wrap the core Event enum: {type, data:{type, data:{...}}}.
+    // Unwrap one level when present so text/message extraction works.
+    let inner = data.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    let data = if inner.is_object() { inner } else { data };
     match typ {
         "inbound_message" => {
             let text = data
@@ -123,12 +127,20 @@ fn route_event(
 /// Map a daemon-side absolute workspace path back to a tree-relative path
 /// ("." for root). Falls back to the input when outside this tree.
 fn tree_path_for(sched: &Arc<Sched>, abs: &str) -> Option<String> {
-    let root = sched.root.to_string_lossy().replace("\\", "/");
+    // Canonicalize: macOS /tmp symlinks to /private/tmp, and the daemon may
+    // report either form. Compare canonicalized prefixes.
+    let canon = |p: &str| {
+        std::fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().replace("\\", "/"))
+            .unwrap_or_else(|_| p.to_string())
+    };
+    let root = canon(&sched.root.to_string_lossy());
+    let abs_c = canon(abs);
     let inst = format!("{root}/_onlyne_workspaces/");
-    if abs == root || abs == format!("{root}/") {
+    if abs_c == root || abs_c == format!("{root}/") {
         return Some(".".into());
     }
-    if let Some(rest) = abs.strip_prefix(&inst) {
+    if let Some(rest) = abs_c.strip_prefix(&inst) {
         return Some(rest.trim_end_matches('/').to_string());
     }
     // Already tree-relative (tests, supervisor submits).

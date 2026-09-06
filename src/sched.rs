@@ -1,7 +1,17 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::broadcast;
+
+/// Process-wide serializer for loopback/in FIFO writes. Concurrent O_WRONLY
+/// opens to the same FIFO can merge at the daemon's read boundary and lose a
+/// message; the scheduler must never lose a callback, so all its FIFO writes
+/// go through this lock. (Agents themselves may still write concurrently;
+/// that risk is explicitly ignored per SPEC.)
+static FIFO_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+fn fifo_lock() -> &'static Mutex<()> {
+    FIFO_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Scheduler events fanned out to swarm.sock `subscribe` clients and the TUI.
 #[derive(Debug, Clone)]
@@ -240,12 +250,15 @@ fn deliver_to_terminal(
 fn write_loopback_in(ws: &std::path::Path, text: &str) -> anyhow::Result<()> {
     // `in` is a real FIFO owned by the workspace daemon: open-write-close
     // delivers one message (EOF ends the message). Never create it here.
+    // Serialized process-wide: see FIFO_WRITE_LOCK.
+    let _guard = fifo_lock().lock().unwrap();
     use std::io::Write;
     let p = crate::root::loopback_in(ws);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .open(&p)?;
     f.write_all(text.as_bytes())?;
+    f.flush()?;
     Ok(())
 }
 
@@ -259,6 +272,15 @@ pub fn on_reply(
     let Some(task) = sched.db.get(task_id)? else {
         return Ok(()); // Unknown task: ignore.
     };
+    // Idempotent redelivery: an already-terminal task (Replied/Failed/
+    // Cancelled/Closed) never re-forwards nor double-decrements the parent.
+    match task.state {
+        crate::db::TaskState::Replied
+        | crate::db::TaskState::Failed
+        | crate::db::TaskState::Cancelled
+        | crate::db::TaskState::Closed => return Ok(()),
+        _ => {}
+    }
     sched.db
         .set_state(task_id, crate::db::TaskState::Replied)?;
     sched.emit(
@@ -276,7 +298,8 @@ pub fn on_reply(
                 attempt: task.attempt,
             };
             let parent_ws = crate::root::resolve_instance(&sched.root, &parent.to_ws);
-            write_loopback_in(&parent_ws, &crate::proto::render(&fwd, "", &msg.payload))?;
+            let wire = crate::proto::render(&fwd, "", &msg.payload);
+            write_loopback_in(&parent_ws, &wire)?;
             sched.emit(
                 "callback_forwarded",
                 serde_json::json!({"task_id": task_id, "to_parent": parent.task_id}),
@@ -418,6 +441,9 @@ pub fn maybe_close(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
 fn close_terminal(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
     let handle = sched.terminals.lock().unwrap().remove(task_id);
     if let Some(h) = handle {
+        if h.starts_with("stub-") {
+            return Ok(());
+        }
         // Best effort: kill pi; orca reclaims the terminal.
         let _ = crate::orca_term::kill_pi(&h);
     }
