@@ -5,9 +5,9 @@ root 下 `.agents/.schedule/{a,b}/template.workspace.jsonc`，role 为回显固�
 model 指向本地可用的 pi 模型。
 
 > 2026-09-06 实测状态：三场景已用 headless stub agent（`SWARM_STUB_AGENT=1` +
-> python 驱动 `swarm_ready` / history 轮询 / `send_message` 回复）全跑通；真实 pi
-> 会话因模型侧 429 余额不足暂未跑，待模型恢复后用 `SWARM_PI_EXT` 指向的本地
-> pi-onlyne（swarm-mode 分支）复测。stub 脚本见本仓库 `e2e/` 目录，一键复跑 `./e2e/run_e2e.sh all`。
+> python 驱动 `swarm_ready` / history 轮询 / `send_message` 回复）全跑通；真实 Orca + pi + pi-onlyne session 已验证 terminal 创建、本地 dev 扩展加载、`swarm_ready`
+> 和 payload 投递入 workspace history。最终模型 reply 依赖可用的模型 provider，本次未把
+> 模型输出冒充协议回调。stub 脚本见本仓库 `e2e/` 目录，一键复跑 `./e2e/run_e2e.sh all`。
 > 实测中修掉的真 bug：事件嵌套 envelope 未解包、`/tmp` vs `/private/tmp`
 > 路径映射、并发回调 FIFO 合并丢失（进程级写锁）、重复投递二次转发
 >（终态守卫）。回放时注意先清残留 daemon（`--workspace` 用 canonical 路径匹配
