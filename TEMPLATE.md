@@ -11,10 +11,12 @@
   root 的模板字段直接写在 `<root>/.onlyne/swarm.workspace.jsonc`（不存在则视为 `{}`）。
   root 也受合并规则约束（上层为空）。
 
-## 2. 字段（终版四项）
+## 2. 字段（终版四项 + `$schema` 编辑器提示）
 
 ```jsonc
 {
+  // 编辑器提示，指向仓库根的 template.workspace.schema.json；调度器忽略
+  "$schema": "../../../../../template.workspace.schema.json",
   // workspace 名，缺省取目录名
   "name": "planner",
   // 系统提示词，内联写进 jsonc（.roles/ 目录已删除，不再约定 md 格式）

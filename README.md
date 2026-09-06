@@ -39,7 +39,21 @@ The package includes the Rust source, protocol documents, TUI document, and the 
 
 Run commands from the swarm root. The current directory becomes the scheduler root and stays local to that scheduler instance.
 
-Create `.agents/.schedule/<agent>/template.workspace.jsonc` files. Each template supports `name`, `role`, `model`, and `back_edges`:
+The fastest path is the initializer (existing files are never overwritten):
+
+```bash
+onlyne-swarm init
+onlyne-swarm export-skill
+```
+
+`init` creates a loopback-only `.onlyne/config.toml` with `[swarm]` on when
+missing. When the directory is already an Onlyne workspace, `init` keeps
+adapters and secrets and only flips `[swarm] enabled = true`. It also writes
+a full `.agents/.schedule/planner/template.workspace.jsonc` starter, a root
+`.onlyne/swarm.workspace.jsonc`, and `.onlyne/.env`.
+
+Templates accept `name`, `role`, `model`, `back_edges`, plus a `$schema`
+editor hint pointing at `template.workspace.schema.json`:
 
 ```text
 swarm-root/
@@ -52,6 +66,7 @@ Example template:
 
 ```jsonc
 {
+  "$schema": "../../../../../template.workspace.schema.json",
   "name": "reviewer",
   "role": "Review the incoming task and return a concise result.",
   "model": {
@@ -144,6 +159,7 @@ The TUI shows workspace paths, back edges, task state, attempts, terminal handle
 - [ARCH.md](ARCH.md) — scheduler architecture
 - [PROTOCOL.md](PROTOCOL.md) — `---swarm` message header
 - [TEMPLATE.md](TEMPLATE.md) — template merge and edge resolution
+- [template.workspace.schema.json](template.workspace.schema.json) — editor schema for full template keys
 - [IPC.md](IPC.md) — `swarm.sock` operations
 - [TUI.md](TUI.md) — monitor layout and controls
 - [TEST.md](TEST.md) — verification scenarios

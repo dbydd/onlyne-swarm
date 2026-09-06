@@ -1,12 +1,14 @@
 mod daemon;
 mod db;
 mod events;
+mod init;
 mod ipc;
 mod orca;
 mod orca_term;
 mod proto;
 mod root;
 mod sched;
+mod skill;
 mod sync;
 mod template;
 mod tui;
@@ -23,6 +25,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Initialize this directory as a swarm root (Onlyne workspace + full template starter)
+    Init,
+    /// Write or refresh the supervisor skill at .agents/skills/onlyne-swarm/SKILL.md
+    ExportSkill,
     /// Start the scheduler in the foreground (cwd is the swarm root; syncs .schedule first)
     Run {
         /// Bypass the ancestor-marker check (allows nested starts)
@@ -82,6 +88,19 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Init => {
+            let cwd = std::env::current_dir()?;
+            let root_p = crate::init::run_init(&cwd)?;
+            println!("initialized swarm root at {}", root_p.display());
+            Ok(())
+        }
+        Cmd::ExportSkill => {
+            let cwd = std::env::current_dir()?;
+            let root_p = root::cwd_root(&cwd);
+            let path = crate::skill::export_skill(&root_p)?;
+            println!("exported skill {}", path.display());
+            Ok(())
+        }
         Cmd::Run { force } => {
             let cwd = std::env::current_dir()?;
             let root_p = root::ensure_root(&cwd, force)?;

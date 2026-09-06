@@ -107,6 +107,7 @@ fn merge_into(acc: &mut WorkspaceTemplate, over: &WorkspaceTemplate, dir_name: &
 
 /// Walk `.agents/.schedule` and produce the effective description per workspace.
 /// Returns (ordered paths, map). Root template comes from `.onlyne/swarm.workspace.jsonc`.
+/// `$schema` is an editor hint only and never participates in merge output.
 pub fn load_tree(root: &Path) -> anyhow::Result<Vec<Effective>> {
     let sched = crate::root::schedule_dir(root);
     let mut out: Vec<Effective> = vec![];

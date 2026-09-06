@@ -11,6 +11,13 @@ homepage = "https://github.com/dbydd/onlyne-swarm"
 readme = "README.md"
 keywords = ["workflow", "scheduler", "multi-agent", "graph", "onlyne"]
 categories = ["command-line-utilities", "development-tools"]
+include = [
+    "src/**",
+    "*.md",
+    "LICENSE",
+    "Cargo.toml",
+    "template.workspace.schema.json",
+]
 
 [[bin]]
 name = "onlyne-swarm"
