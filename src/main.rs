@@ -13,7 +13,12 @@ mod sync;
 mod template;
 mod tui;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{
+    generate,
+    shells::{Fish, Zsh},
+};
+use std::io;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -66,6 +71,10 @@ enum Cmd {
     Status,
     /// Open the monitoring TUI (connects to the running scheduler)
     Tui,
+    /// Print shell completions (zsh or fish) to stdout
+    ShellCompletions {
+        shell: CompletionShell,
+    },
     /// Manage generated workspace instances
     Workspace {
         #[command(subcommand)]
@@ -79,6 +88,12 @@ enum WorkspaceCmd {
     Create,
     /// Same as create (reconcile; never deletes instances or hand-written files)
     Sync,
+}
+
+#[derive(Copy, Clone, clap::ValueEnum)]
+enum CompletionShell {
+    Zsh,
+    Fish,
 }
 
 #[tokio::main]
@@ -170,6 +185,10 @@ async fn main() -> anyhow::Result<()> {
             let root_p = root::cwd_root(&cwd);
             tui::run_tui(&root::swarm_sock(&root_p))
         }
+        Cmd::ShellCompletions { shell } => {
+            shell_completions(shell);
+            Ok(())
+        }
         Cmd::Workspace { cmd } => {
             let cwd = std::env::current_dir()?;
             let root_p = root::ensure_root(&cwd, false)?;
@@ -181,5 +200,57 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+    }
+}
+
+fn shell_completions(shell: CompletionShell) {
+    let mut cmd = Cli::command();
+    let name = cmd.get_name().to_string();
+    match shell {
+        CompletionShell::Zsh => generate(Zsh, &mut cmd, name, &mut io::stdout()),
+        CompletionShell::Fish => generate(Fish, &mut cmd, name, &mut io::stdout()),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap_complete::shells::{Fish, Zsh};
+
+    fn completion_text(shell: impl clap_complete::Generator) -> String {
+        let mut cmd = Cli::command();
+        let name = cmd.get_name().to_string();
+        let mut out = Vec::new();
+        generate(shell, &mut cmd, name, &mut out);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn completion_command_is_exposed() {
+        let cmd = Cli::command();
+        assert!(
+            cmd.get_subcommands()
+                .any(|sc| sc.get_name() == "shell-completions")
+        );
+    }
+
+    #[test]
+    fn completions_include_swarm_commands() {
+        let text = completion_text(Zsh);
+        assert!(text.contains("export-skill"));
+        assert!(text.contains("shell-completions"));
+        assert!(!text.contains("--shell-completions"));
+    }
+
+    #[test]
+    fn zsh_completion_mentions_swarm() {
+        let text = completion_text(Zsh);
+        assert!(text.contains("#compdef onlyne-swarm"));
+    }
+
+    #[test]
+    fn fish_completion_mentions_swarm() {
+        let text = completion_text(Fish);
+        assert!(text.contains("complete -c onlyne-swarm"));
     }
 }

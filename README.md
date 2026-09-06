@@ -116,7 +116,8 @@ onlyne-swarm status
 onlyne-swarm list
 onlyne-swarm list --state running
 onlyne-swarm cancel <task-id> --reason "manual stop"
-onlyne-swarm tui
+onlyne-swarm shell-completions zsh
+onlyne-swarm shell-completions fish
 ```
 
 `task_id` identifies the full task family. `cancel` terminates the selected family and its live terminals. Cyclic workflows have no automatic stop condition.
@@ -152,6 +153,13 @@ onlyne-swarm tui
 ```
 
 The TUI shows workspace paths, back edges, task state, attempts, terminal handles, daemon health, pending callbacks, and dead letters. Use the documented key bindings in [TUI.md](TUI.md).
+
+## Shell completions
+
+```bash
+onlyne-swarm shell-completions zsh
+onlyne-swarm shell-completions fish
+```
 
 ## Configuration and protocol
 
