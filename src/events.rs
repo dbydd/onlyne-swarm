@@ -32,7 +32,7 @@ fn watch_once(sched: &Arc<Sched>, ws_path: &str, sock: &std::path::Path) -> anyh
     // Top-priority subscription. Requires the onlyne本体 priority extension
     // (see ARCH.md §5); older daemons ignore the field and behave as before.
     stream.write_all(
-        b"{\"id\":\"swarm\",\"op\":\"subscribe_events\",\"priority\":4294967295}\n",
+        b"{\"id\":\"swarm\",\"op\":\"subscribe_events\",\"priority\":4294967295,\"consume_timeout_ms\":400}\n",
     )?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
@@ -89,17 +89,30 @@ fn route_event(
                 }
             }
         }
-        "swarm_ready" => {
-            // pi-onlyne swarm-mode handshake (new op in pi-onlyne, daemon forwards).
-            let handle = data
+        "workspace_state_changed" => {
+            // pi-onlyne swarm-mode handshake arrives as a WorkspaceStateChanged
+            // event whose message is `swarm_ready {workspace, terminal_handle}`.
+            let msg = data
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            let body = msg.strip_prefix("swarm_ready ").unwrap_or("");
+            if body.is_empty() {
+                return;
+            }
+            let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+            let handle = parsed
                 .get("terminal_handle")
                 .and_then(|h| h.as_str())
                 .unwrap_or("");
-            let w = data
+            let w = parsed
                 .get("workspace")
                 .and_then(|w| w.as_str())
                 .unwrap_or(ws_path);
-            if let Err(e) = sched::on_ready(sched, w, handle) {
+            // Map the daemon-side absolute workspace path back to a tree path.
+            let w = tree_path_for(sched, w).unwrap_or_else(|| w.to_string());
+            consumed_ack(stream, v);
+            if let Err(e) = sched::on_ready(sched, &w, handle) {
                 tracing::warn!(error = %e, "on_ready failed");
             }
         }
@@ -107,13 +120,38 @@ fn route_event(
     }
 }
 
-/// A swarm task arrived at a workspace in-channel: register it (idempotent)
-/// and let the dispatcher create/assign a session.
+/// Map a daemon-side absolute workspace path back to a tree-relative path
+/// ("." for root). Falls back to the input when outside this tree.
+fn tree_path_for(sched: &Arc<Sched>, abs: &str) -> Option<String> {
+    let root = sched.root.to_string_lossy().replace("\\", "/");
+    let inst = format!("{root}/_onlyne_workspaces/");
+    if abs == root || abs == format!("{root}/") {
+        return Some(".".into());
+    }
+    if let Some(rest) = abs.strip_prefix(&inst) {
+        return Some(rest.trim_end_matches('/').to_string());
+    }
+    // Already tree-relative (tests, supervisor submits).
+    if !abs.starts_with('/') {
+        return Some(abs.to_string());
+    }
+    None
+}
+
+/// A swarm task arrived at a workspace in-channel: register it (idempotent,
+/// payload persisted) and dispatch a session for it.
 fn on_task_inbound(sched: &Arc<Sched>, ws_path: &str, msg: &crate::proto::SwarmMessage) {
     let to = if ws_path == "." { "." } else { ws_path };
     let inserted = sched
         .db
-        .insert_task(&msg.header.task_id, &msg.header.from, to, &msg.header.reply_to, msg.header.attempt)
+        .insert_task(
+            &msg.header.task_id,
+            &msg.header.from,
+            to,
+            &msg.header.reply_to,
+            msg.header.attempt,
+            &msg.payload,
+        )
         .unwrap_or(false);
     if !inserted {
         return; // Duplicate delivery: drop.
@@ -126,11 +164,10 @@ fn on_task_inbound(sched: &Arc<Sched>, ws_path: &str, msg: &crate::proto::SwarmM
         "task_created",
         serde_json::json!({"task_id": msg.header.task_id, "from": msg.header.from, "to": to}),
     );
-    // NOTE: full dispatch (terminal create) happens in the sched loop; v1
-    // marks running here so `list` reflects the task immediately.
-    let _ = sched
-        .db
-        .set_state(&msg.header.task_id, crate::db::TaskState::Pending);
+    if let Err(e) = sched::dispatch_public(sched, &msg.header.task_id, to) {
+        tracing::warn!(task = %msg.header.task_id, error = %e, "dispatch failed");
+        let _ = sched::on_early_exit(sched, &msg.header.task_id, "dispatch failed");
+    }
 }
 
 /// Reply with the `consume` op naming the event's `event_seq`, so the

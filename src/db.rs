@@ -48,6 +48,8 @@ pub struct TaskRow {
     pub state: TaskState,
     pub pending_replies: i64,
     pub terminal: String,
+    #[serde(skip_serializing)]
+    pub payload: String,
 }
 
 pub struct Db {
@@ -71,8 +73,10 @@ impl Db {
                state TEXT NOT NULL DEFAULT 'pending',
                pending_replies INTEGER NOT NULL DEFAULT 0,
                terminal TEXT NOT NULL DEFAULT '',
+               payload TEXT NOT NULL DEFAULT '',
                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
              );
+             CREATE TABLE IF NOT EXISTS schema_flags(name TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS dead_letter(
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                task_id TEXT NOT NULL,
@@ -80,16 +84,48 @@ impl Db {
                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
              );",
         )?;
+        // Idempotent migration for pre-payload databases.
+        let migrated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_flags WHERE name='payload_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if migrated == 0 {
+            let has_payload: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='payload'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if has_payload == 0 {
+                conn.execute("ALTER TABLE tasks ADD COLUMN payload TEXT NOT NULL DEFAULT ''", [])?;
+            }
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_flags(name) VALUES('payload_v1')",
+                [],
+            )?;
+        }
         Ok(Self {
             inner: Mutex::new(conn),
         })
     }
 
-    pub fn insert_task(&self, task_id: &str, from_ws: &str, to_ws: &str, reply_to: &str, attempt: u32) -> anyhow::Result<bool> {
+    pub fn insert_task(
+        &self,
+        task_id: &str,
+        from_ws: &str,
+        to_ws: &str,
+        reply_to: &str,
+        attempt: u32,
+        payload: &str,
+    ) -> anyhow::Result<bool> {
         let c = self.inner.lock().unwrap();
         let n = c.execute(
-            "INSERT OR IGNORE INTO tasks(task_id, from_ws, to_ws, reply_to, attempt) VALUES(?,?,?,?,?)",
-            params![task_id, from_ws, to_ws, reply_to, attempt],
+            "INSERT OR IGNORE INTO tasks(task_id, from_ws, to_ws, reply_to, attempt, payload) VALUES(?,?,?,?,?,?)",
+            params![task_id, from_ws, to_ws, reply_to, attempt, payload],
         )?;
         Ok(n == 1)
     }
@@ -124,7 +160,7 @@ impl Db {
     pub fn get(&self, task_id: &str) -> anyhow::Result<Option<TaskRow>> {
         let c = self.inner.lock().unwrap();
         let mut st = c.prepare(
-            "SELECT task_id, from_ws, to_ws, reply_to, attempt, state, pending_replies, terminal FROM tasks WHERE task_id=?",
+            "SELECT task_id, from_ws, to_ws, reply_to, attempt, state, pending_replies, terminal, payload FROM tasks WHERE task_id=?",
         )?;
         let mut rows = st.query(params![task_id])?;
         let Some(r) = rows.next()? else { return Ok(None) };
@@ -141,7 +177,7 @@ impl Db {
         let mut st = c.prepare(
             "WITH RECURSIVE fam(id) AS (
                SELECT ? UNION SELECT task_id FROM tasks, fam WHERE reply_to = fam.id
-             ) SELECT task_id, from_ws, to_ws, reply_to, attempt, state, pending_replies, terminal
+             ) SELECT task_id, from_ws, to_ws, reply_to, attempt, state, pending_replies, terminal, payload
                FROM tasks WHERE task_id IN fam",
         )?;
         let rows = st.query_map(params![task_id], row)?;
@@ -155,9 +191,9 @@ impl Db {
     pub fn list(&self, state: Option<&str>, limit: usize) -> anyhow::Result<Vec<TaskRow>> {
         let c = self.inner.lock().unwrap();
         let sql = if state.is_some() {
-            "SELECT task_id, from_ws, to_ws, reply_to, attempt, state, pending_replies, terminal FROM tasks WHERE state=? ORDER BY created_at DESC LIMIT ?"
+            "SELECT task_id, from_ws, to_ws, reply_to, attempt, state, pending_replies, terminal, payload FROM tasks WHERE state=? ORDER BY created_at DESC LIMIT ?"
         } else {
-            "SELECT task_id, from_ws, to_ws, reply_to, attempt, state, pending_replies, terminal FROM tasks ORDER BY created_at DESC LIMIT ?"
+            "SELECT task_id, from_ws, to_ws, reply_to, attempt, state, pending_replies, terminal, payload FROM tasks ORDER BY created_at DESC LIMIT ?"
         };
         let mut st = c.prepare(sql)?;
         let iter = if let Some(s) = state {
@@ -214,6 +250,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         state: TaskState::from_str(&r.get::<_, String>(5)?),
         pending_replies: r.get(6)?,
         terminal: r.get(7)?,
+        payload: r.get(8).unwrap_or_default(),
     })
 }
 
@@ -224,14 +261,15 @@ mod tests {
     fn insert_is_idempotent_and_parent_counts() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path()).unwrap();
-        assert!(db.insert_task("a", ".", "x", "", 1).unwrap());
-        assert!(!db.insert_task("a", ".", "x", "", 1).unwrap());
-        db.insert_task("b", "x", "y", "a", 1).unwrap();
+        assert!(db.insert_task("a", ".", "x", "", 1, "pa").unwrap());
+        assert!(!db.insert_task("a", ".", "x", "", 1, "pa").unwrap());
+        db.insert_task("b", "x", "y", "a", 1, "pb").unwrap();
         db.bump_parent("a", 1).unwrap();
         let p = db.get("a").unwrap().unwrap();
         assert_eq!(p.pending_replies, 1);
         let p = db.dec_parent("a").unwrap().unwrap();
         assert_eq!(p.pending_replies, 0);
         assert_eq!(db.family("a").unwrap().len(), 2);
+        assert_eq!(db.get("a").unwrap().unwrap().payload, "pa");
     }
 }

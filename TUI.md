@@ -1,6 +1,6 @@
 # TUI 监控面板（TUI）
 
-ratatui 实现的 swarm.sock 订阅客户端。`onlyne-swarm tui` 启动（需调度器在运行，
+ratatui 实现的 swarm.sock 客户端（2s 全量轮询 + 事件驱动刷新）。`onlyne-swarm tui` 启动（需调度器在运行，
 否则提示先 `run`）。只读展示 + 两个动作键（cancel、toggle_swarm）。
 告警只标红展示，不得干扰正常运行。
 
@@ -28,8 +28,7 @@ ratatui 实现的 swarm.sock 订阅客户端。`onlyne-swarm tui` 启动（需�
 
 ## 2. 数据源
 
-全部经 swarm.sock `subscribe` 事件增量更新，启动时 `list_workspaces` +
-`list_tasks` 拉全量。断线 1s 后重连并重拉全量。
+2s 间隔全量 `list_workspaces` + `list_tasks` 轮询刷新（`subscribe` 流为后续增量源，当前版本轮询已满足排障需求）。按键 `↑↓/jk` 选任务，`c` 取消选中任务族，`t` 切换 root swarm 开关，`q` 退出。
 
 ## 3. 开关语义（toggle）
 

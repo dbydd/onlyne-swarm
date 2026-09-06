@@ -74,30 +74,25 @@ pub fn submit(
     payload_markdown: &str,
 ) -> anyhow::Result<String> {
     let tree = crate::template::load_tree(&sched.root)?;
-    let target = tree.iter().find(|e| {
+    let known = tree.iter().any(|e| {
         let p = if e.path.is_empty() { "." } else { &e.path };
         p == to
     });
-    let Some(target) = target else {
+    if !known {
         anyhow::bail!("unknown workspace: {to}");
-    };
+    }
     let task_id = uuid::Uuid::new_v4().to_string();
-    let inserted = sched
-        .db
-        .insert_task(&task_id, from, to, "", 1)?;
+    let inserted = sched.db.insert_task(
+        &task_id,
+        from,
+        to,
+        "",
+        1,
+        payload_markdown,
+    )?;
     if !inserted {
         anyhow::bail!("duplicate task_id: {task_id}");
     }
-    if !from.is_empty() {
-        sched.db.bump_parent(from, 0)?; // no-op guard for clarity
-    }
-    let header = crate::proto::SwarmHeader {
-        task_id: task_id.clone(),
-        from: from.into(),
-        reply_to: String::new(),
-        attempt: 1,
-    };
-    let _wire = crate::proto::render(&header, &target.role, payload_markdown);
     sched.emit(
         "task_created",
         serde_json::json!({"task_id": task_id, "from": from, "to": to}),
@@ -108,6 +103,11 @@ pub fn submit(
 
 /// Dispatch a pending task: reuse an idle ready terminal on the same path,
 /// else create a new orca terminal running pi and wait for `swarm_ready`.
+/// Public so the event pump can dispatch tasks arriving via loopback/in.
+pub fn dispatch_public(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::Result<()> {
+    dispatch(sched, task_id, to)
+}
+
 fn dispatch(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::Result<()> {
     // 1. Try idle pool (same workspace path affinity).
     let idle_handle = sched
@@ -121,22 +121,12 @@ fn dispatch(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::Result<()> {
         deliver_to_terminal(sched, task_id, to, &handle)?;
         return Ok(());
     }
-    // 2. Create a new terminal.
+    // 2. Create a new terminal running pi in swarm mode. The session reports
+    // `swarm_ready`; on_ready() then delivers the persisted payload through
+    // loopback/in into the session's followUp task queue.
     let ws = crate::root::resolve_instance(&sched.root, to);
     let title = format!("swarm:{to}:{task_id_short}", task_id_short = &task_id[..8]);
     let term = crate::orca_term::create(&title, &ws, task_id)?;
-    // TEMPORARY v1: inject first prompt directly (no pi-onlyne swarm mode yet).
-    // Spawned thread so submit returns immediately; failures mark early-exit.
-    {
-        let s = sched.clone();
-        let tid = task_id.to_string();
-        std::thread::spawn(move || {
-            if let Err(e) = deliver_first_prompt(&s, &tid) {
-                tracing::warn!(task = %tid, error = %e, "first-prompt inject failed");
-                let _ = on_early_exit(&s, &tid, "first-prompt inject failed");
-            }
-        });
-    }
     sched
         .terminals
         .lock()
@@ -154,60 +144,6 @@ fn dispatch(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::Result<()> {
         "task_running",
         serde_json::json!({"task_id": task_id, "to": to, "terminal_handle": term.handle}),
     );
-    Ok(())
-}
-
-/// TEMPORARY v1 fallback: deliver the task payload file path directly into the
-/// new terminal via `orca terminal send`, because pi-onlyne has no swarm mode
-/// yet (no `swarm_ready`, no followUp task queue). The task text is injected
-/// as the session's first prompt. Replaced by the swarm_ready handshake once
-/// pi-onlyne gains swarm mode (SPEC §5).
-pub fn deliver_first_prompt(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
-    let Some(task) = sched.db.get(task_id)? else {
-        return Ok(());
-    };
-    let handle = sched
-        .terminals
-        .lock()
-        .unwrap()
-        .get(task_id)
-        .cloned()
-        .unwrap_or_default();
-    if handle.is_empty() {
-        return Ok(());
-    }
-    let tree = crate::template::load_tree(&sched.root)?;
-    let role = tree
-        .iter()
-        .find(|e| {
-            let p = if e.path.is_empty() { "." } else { &e.path };
-            p == task.to_ws
-        })
-        .map(|e| e.role.clone())
-        .unwrap_or_default();
-    let header = crate::proto::SwarmHeader {
-        task_id: task.task_id.clone(),
-        from: task.from_ws.clone(),
-        reply_to: task.reply_to.clone(),
-        attempt: task.attempt,
-    };
-    // NOTE: payload store is v2; v1 injects header + role only.
-    let prompt = crate::proto::render(&header, &role, "");
-    // Wait for the pi TUI to become idle before sending (avoid lost input).
-    let _ = wait_tui_idle(&handle);
-    crate::orca_term::send(&handle, &prompt, true)?;
-    sched
-        .awaiting_ready
-        .lock()
-        .unwrap()
-        .remove(task_id);
-    Ok(())
-}
-
-fn wait_tui_idle(_handle: &str) -> anyhow::Result<()> {
-    // Best effort: give pi time to boot. Real readiness gating comes with
-    // swarm_ready in pi-onlyne swarm mode.
-    std::thread::sleep(std::time::Duration::from_secs(8));
     Ok(())
 }
 
@@ -281,16 +217,14 @@ fn deliver_to_terminal(
         })
         .map(|e| e.role.clone())
         .unwrap_or_default();
-    // Reconstruct wire text. Payload is not stored in the db in v1; the header
-    // plus role are enough to wake the session, and the full text lives in the
-    // loopback channel history. (Payload store is a planned v2 addition.)
+    // Full wire text from the persisted payload: header + role + payload.
     let header = crate::proto::SwarmHeader {
         task_id: task_id.into(),
         from: task.from_ws.clone(),
         reply_to: task.reply_to.clone(),
         attempt: task.attempt,
     };
-    let wire = crate::proto::render(&header, &role, "");
+    let wire = crate::proto::render(&header, &role, &task.payload);
     write_loopback_in(&crate::root::resolve_instance(&sched.root, to), &wire)?;
     sched.db.set_terminal(task_id, handle)?;
     sched
