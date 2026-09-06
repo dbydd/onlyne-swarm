@@ -73,7 +73,7 @@ fn route_event(
             if let Some(msg) = crate::proto::parse(text) {
                 // Swarm task inbound: consume (cancel lower-priority delivery),
                 // then schedule a session for it.
-                let _ = consumed_ack(stream);
+                consumed_ack(stream, v);
                 on_task_inbound(sched, ws_path, &msg);
             }
         }
@@ -83,7 +83,7 @@ fn route_event(
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
             if let Some(msg) = crate::proto::parse(text) {
-                let _ = consumed_ack(stream);
+                consumed_ack(stream, v);
                 if let Err(e) = sched::on_reply(sched, ws_path, &msg) {
                     tracing::warn!(error = %e, "on_reply failed");
                 }
@@ -133,7 +133,13 @@ fn on_task_inbound(sched: &Arc<Sched>, ws_path: &str, msg: &crate::proto::SwarmM
         .set_state(&msg.header.task_id, crate::db::TaskState::Pending);
 }
 
-fn consumed_ack(stream: &mut UnixStream) -> anyhow::Result<()> {
-    stream.write_all(b"{\"consumed\":true}\n")?;
-    Ok(())
+/// Reply with the `consume` op naming the event's `event_seq`, so the
+/// daemon skips all lower-priority tiers for this event.
+fn consumed_ack(stream: &mut UnixStream, v: &serde_json::Value) {
+    let Some(seq) = v.get("event_seq").and_then(|s| s.as_u64()) else {
+        return;
+    };
+    use std::io::Write;
+    let line = serde_json::json!({"id": "swarm-consume", "op": "consume", "event_seq": seq});
+    let _ = writeln!(stream, "{line}");
 }
