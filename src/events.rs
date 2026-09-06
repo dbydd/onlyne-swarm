@@ -75,9 +75,10 @@ fn route_event(
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
             if let Some(msg) = crate::proto::parse(text) {
-                // Swarm task inbound: consume (cancel lower-priority delivery),
-                // then schedule a session for it.
-                consumed_ack(stream, v);
+                // Swarm task inbound: schedule a session for it. Do NOT
+                // consume: the pi-onlyne session sits at tier 1 and needs
+                // the same event to claim its hop. The scheduler already
+                // ignores duplicate task_ids, so double delivery is safe.
                 on_task_inbound(sched, ws_path, &msg);
             }
         }
