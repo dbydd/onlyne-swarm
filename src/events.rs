@@ -126,16 +126,18 @@ fn route_event(
 
 /// Map a daemon-side absolute workspace path back to a tree-relative path
 /// ("." for root). Falls back to the input when outside this tree.
+/// Pure prefix logic lives in tree_path_for_root() (unit-tested); this
+/// wrapper only canonicalizes both sides first (/tmp vs /private/tmp).
 fn tree_path_for(sched: &Arc<Sched>, abs: &str) -> Option<String> {
-    // Canonicalize: macOS /tmp symlinks to /private/tmp, and the daemon may
-    // report either form. Compare canonicalized prefixes.
     let canon = |p: &str| {
         std::fs::canonicalize(p)
             .map(|c| c.to_string_lossy().replace("\\", "/"))
             .unwrap_or_else(|_| p.to_string())
     };
-    let root = canon(&sched.root.to_string_lossy());
-    let abs_c = canon(abs);
+    tree_path_for_root(&canon(&sched.root.to_string_lossy()), &canon(abs))
+}
+
+fn tree_path_for_root(root: &str, abs_c: &str) -> Option<String> {
     let inst = format!("{root}/_onlyne_workspaces/");
     if abs_c == root || abs_c == format!("{root}/") {
         return Some(".".into());
@@ -144,8 +146,8 @@ fn tree_path_for(sched: &Arc<Sched>, abs: &str) -> Option<String> {
         return Some(rest.trim_end_matches('/').to_string());
     }
     // Already tree-relative (tests, supervisor submits).
-    if !abs.starts_with('/') {
-        return Some(abs.to_string());
+    if !abs_c.starts_with('/') {
+        return Some(abs_c.to_string());
     }
     None
 }
@@ -191,4 +193,31 @@ fn consumed_ack(stream: &mut UnixStream, v: &serde_json::Value) {
     use std::io::Write;
     let line = serde_json::json!({"id": "swarm-consume", "op": "consume", "event_seq": seq});
     let _ = writeln!(stream, "{line}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tree_path_for_root;
+
+    #[test]
+    fn daemon_paths_map_to_tree_paths() {
+        // Root itself (both /tmp spellings canonicalize before this fn).
+        assert_eq!(tree_path_for_root("/r", "/r"), Some(".".into()));
+        assert_eq!(tree_path_for_root("/r", "/r/"), Some(".".into()));
+        // Nested instances.
+        assert_eq!(
+            tree_path_for_root("/r", "/r/_onlyne_workspaces/a"),
+            Some("a".into())
+        );
+        assert_eq!(
+            tree_path_for_root("/r", "/r/_onlyne_workspaces/a/b/"),
+            Some("a/b".into())
+        );
+        // Tree-relative input passes through (tests, supervisor submits).
+        assert_eq!(tree_path_for_root("/r", "a"), Some("a".into()));
+        // Outside the tree: no mapping.
+        assert_eq!(tree_path_for_root("/r", "/other/x"), None);
+        // A sibling that merely shares the prefix must not match.
+        assert_eq!(tree_path_for_root("/r", "/r-evil/a"), None);
+    }
 }
