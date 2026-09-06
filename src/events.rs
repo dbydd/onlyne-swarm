@@ -1,0 +1,139 @@
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::sync::Arc;
+
+use crate::sched::{self, Sched};
+
+/// Subscribe to every workspace daemon's `onlyne.sock` at top priority and
+/// route swarm traffic. Runs on a plain thread (blocking sockets), one
+/// connection per workspace daemon, with reconnect on drop.
+pub fn pump(sched: Arc<Sched>) {
+    let tree = crate::template::load_tree(&sched.root).unwrap_or_default();
+    for e in tree {
+        let s = sched.clone();
+        let path = if e.path.is_empty() { "." } else { &e.path }.to_string();
+        std::thread::spawn(move || watch_workspace(s, path));
+    }
+}
+
+fn watch_workspace(sched: Arc<Sched>, ws_path: String) {
+    loop {
+        let ws = crate::root::resolve_instance(&sched.root, &ws_path);
+        let sock = crate::root::onlyne_sock(&ws);
+        if let Err(e) = watch_once(&sched, &ws_path, &sock) {
+            tracing::warn!(workspace = %ws_path, error = %e, "daemon watch dropped; reconnecting");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+fn watch_once(sched: &Arc<Sched>, ws_path: &str, sock: &std::path::Path) -> anyhow::Result<()> {
+    let mut stream = UnixStream::connect(sock)?;
+    // Top-priority subscription. Requires the onlyne本体 priority extension
+    // (see ARCH.md §5); older daemons ignore the field and behave as before.
+    stream.write_all(
+        b"{\"id\":\"swarm\",\"op\":\"subscribe_events\",\"priority\":4294967295}\n",
+    )?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            return Ok(());
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        route_event(sched, ws_path, &v, &mut stream);
+    }
+}
+
+fn route_event(
+    sched: &Arc<Sched>,
+    ws_path: &str,
+    v: &serde_json::Value,
+    stream: &mut UnixStream,
+) {
+    if v.get("event").and_then(|e| e.as_bool()) != Some(true) {
+        return;
+    }
+    let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+    match typ {
+        "inbound_message" => {
+            let text = data
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if let Some(msg) = crate::proto::parse(text) {
+                // Swarm task inbound: consume (cancel lower-priority delivery),
+                // then schedule a session for it.
+                let _ = consumed_ack(stream);
+                on_task_inbound(sched, ws_path, &msg);
+            }
+        }
+        "outbound_message" => {
+            let text = data
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if let Some(msg) = crate::proto::parse(text) {
+                let _ = consumed_ack(stream);
+                if let Err(e) = sched::on_reply(sched, ws_path, &msg) {
+                    tracing::warn!(error = %e, "on_reply failed");
+                }
+            }
+        }
+        "swarm_ready" => {
+            // pi-onlyne swarm-mode handshake (new op in pi-onlyne, daemon forwards).
+            let handle = data
+                .get("terminal_handle")
+                .and_then(|h| h.as_str())
+                .unwrap_or("");
+            let w = data
+                .get("workspace")
+                .and_then(|w| w.as_str())
+                .unwrap_or(ws_path);
+            if let Err(e) = sched::on_ready(sched, w, handle) {
+                tracing::warn!(error = %e, "on_ready failed");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A swarm task arrived at a workspace in-channel: register it (idempotent)
+/// and let the dispatcher create/assign a session.
+fn on_task_inbound(sched: &Arc<Sched>, ws_path: &str, msg: &crate::proto::SwarmMessage) {
+    let to = if ws_path == "." { "." } else { ws_path };
+    let inserted = sched
+        .db
+        .insert_task(&msg.header.task_id, &msg.header.from, to, &msg.header.reply_to, msg.header.attempt)
+        .unwrap_or(false);
+    if !inserted {
+        return; // Duplicate delivery: drop.
+    }
+    // Parent bookkeeping: a new child means +1 pending on the parent.
+    if !msg.header.reply_to.is_empty() {
+        let _ = sched.db.bump_parent(&msg.header.reply_to, 1);
+    }
+    sched.emit(
+        "task_created",
+        serde_json::json!({"task_id": msg.header.task_id, "from": msg.header.from, "to": to}),
+    );
+    // NOTE: full dispatch (terminal create) happens in the sched loop; v1
+    // marks running here so `list` reflects the task immediately.
+    let _ = sched
+        .db
+        .set_state(&msg.header.task_id, crate::db::TaskState::Pending);
+}
+
+fn consumed_ack(stream: &mut UnixStream) -> anyhow::Result<()> {
+    stream.write_all(b"{\"consumed\":true}\n")?;
+    Ok(())
+}

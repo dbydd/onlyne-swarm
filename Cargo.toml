@@ -1,0 +1,31 @@
+[package]
+name = "onlyne-swarm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["dbydd <1992003927@qq.com>"]
+description = "Reactive multi-agent directed cyclic graph workflow scheduler derived from Onlyne"
+license = "MIT"
+repository = "https://github.com/dbydd/onlyne-swarm"
+
+[[bin]]
+name = "onlyne-swarm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "fs", "process", "sync", "time", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+json5 = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ratatui = "0.29"
+crossterm = "0.28"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
