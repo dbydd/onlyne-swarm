@@ -49,15 +49,6 @@ pub fn swarm_sock(root: &Path) -> PathBuf {
     root.join(".onlyne/run/swarm.sock")
 }
 
-/// Tree-relative path of a workspace, e.g. "planner/worker". Root is ".".
-pub fn tree_rel(root: &Path, ws: &Path) -> anyhow::Result<String> {
-    let rel = ws.strip_prefix(root).unwrap_or(ws);
-    if rel.as_os_str().is_empty() {
-        return Ok(".".into());
-    }
-    Ok(rel.to_string_lossy().replace('\\', "/"))
-}
-
 /// Resolve an instance workspace dir from a tree-relative target ("a/b", "." = root itself).
 pub fn resolve_instance(root: &Path, target: &str) -> PathBuf {
     if target == "." || target.is_empty() {
@@ -101,13 +92,4 @@ mod tests {
         assert!(ensure_root(&child, true).is_ok());
     }
 
-    #[test]
-    fn tree_rel_root_is_dot() {
-        let root = PathBuf::from("/r");
-        assert_eq!(tree_rel(&root, &root).unwrap(), ".");
-        assert_eq!(
-            tree_rel(&root, &PathBuf::from("/r/a/b")).unwrap(),
-            "a/b"
-        );
-    }
 }
