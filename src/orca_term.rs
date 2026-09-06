@@ -30,8 +30,6 @@ fn run_json(mut cmd: Command) -> anyhow::Result<Value> {
 /// correlate; the actual task bytes are delivered later via loopback/in
 /// after `swarm_ready` (avoids create-vs-write races).
 ///
-/// `SWARM_PI_EXT` env (scheduler side) optionally prepends `-e <path>` args
-/// so e2e trees can load a local pi-onlyne build instead of the global one.
 /// Stub hook for headless e2e: when `SWARM_STUB_AGENT=1`, no orca terminal
 /// is created. Instead a fake handle is returned and the test harness is
 /// expected to drive `swarm_ready` + task reply itself (see TEST.md).
@@ -43,10 +41,9 @@ pub fn create(title: &str, cwd: &std::path::Path, env_task: &str) -> anyhow::Res
     }
     let mut cmd = orca();
     cmd.args(["terminal", "create", "--title", title, "--command"]);
-    // Escape for sh -c style consumption: orca runs the string in a shell.
-    // (Quoting rules live in session_command(), unit-tested below.)
-    let ext = std::env::var("SWARM_PI_EXT").unwrap_or_default();
-    cmd.arg(session_command(cwd, env_task, &ext));
+    // Keep normal extension discovery enabled so retry and other configured
+    // extensions are available in real swarm sessions.
+    cmd.arg(session_command(cwd, env_task));
     let v = run_json(cmd)?;
     let handle = parse_terminal_handle(&v).unwrap_or_default();
     if handle.is_empty() {
@@ -108,18 +105,11 @@ pub fn parse_terminal_handle(v: &Value) -> Option<String> {
 
 /// Build the shell command run inside a fresh orca terminal for a task.
 /// Pure constructor so quoting bugs are caught by unit tests, not in prod.
-pub fn session_command(workspace_dir: &std::path::Path, task_id: &str, ext: &str) -> String {
-    let (ne, ext_args) = if ext.trim().is_empty() {
-        (String::new(), String::new())
-    } else {
-        (" -ne".to_string(), format!(" -e {}", shell_escape(ext)))
-    };
+pub fn session_command(workspace_dir: &std::path::Path, task_id: &str) -> String {
     format!(
-        "cd {} && ONLYNE_SWARM_TASK={} pi{}{}",
+        "cd {} && ONLYNE_SWARM_TASK={} pi",
         shell_escape(&workspace_dir.to_string_lossy()),
         shell_escape(task_id),
-        ne,
-        ext_args
     )
 }
 
@@ -167,20 +157,14 @@ mod tests {
         let cmd = session_command(
             std::path::Path::new("/tmp/a b/c"),
             "task-1",
-            "",
         );
         assert!(cmd.starts_with("cd '/tmp/a b/c'"), "{cmd}");
         assert!(cmd.contains("ONLYNE_SWARM_TASK='task-1'"), "{cmd}");
         assert!(cmd.ends_with(" pi"), "{cmd}");
-        // Local extension build: -ne avoids collision with global pi-onlyne.
-        let cmd = session_command(
-            std::path::Path::new("/w"),
-            "t",
-            "/ext/index.js",
-        );
-        assert!(cmd.contains(" pi -ne -e '/ext/index.js'"), "{cmd}");
+        // Real sessions use normal discovery, including configured retries.
+        assert!(!cmd.contains("-ne"), "{cmd}");
         // Single quotes in paths are escaped, never break the shell string.
-        let cmd = session_command(std::path::Path::new("/o'b"), "t", "");
+        let cmd = session_command(std::path::Path::new("/o'b"), "t");
         assert!(cmd.contains("'/o'\\''b'"), "{cmd}");
     }
 
