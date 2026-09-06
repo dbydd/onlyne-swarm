@@ -154,7 +154,17 @@ print(ds[0]['task_id'] if ds else '')")
   (cd "$E2E_ROOT" && swarm cancel "$live" --reason "e2e-3 stop" >/dev/null)
   sleep 5
   pkill -f "stub_loop.py $E2E_ROOT" || true
-  sleep 8
+  # quiesce: cancelled chain members are terminal; any still-running tasks
+  # belong to sibling chains whose stubs just died -> cancel them too.
+  for _ in $(seq 1 10); do
+    live=$(cd "$E2E_ROOT" && swarm list --state running 2>/dev/null | python3 -c "
+import json,sys
+ds = json.load(sys.stdin)['data']
+print(ds[0]['task_id'] if ds else '')")
+    [[ -n "$live" ]] || break
+    (cd "$E2E_ROOT" && swarm cancel "$live" --reason "e2e-3 quiesce" >/dev/null)
+    sleep 2
+  done
   local running; running=$(cd "$E2E_ROOT" && swarm list --state running 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
   [[ "$running" == "0" ]] || die "E2E-3 $running tasks still running after cancel+stubkill"
   log "E2E-3 PASS"
