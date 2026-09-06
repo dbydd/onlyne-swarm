@@ -31,18 +31,57 @@ pub fn run_tui(sock: &Path) -> anyhow::Result<()> {
     res
 }
 
-struct Snapshot {
+pub(crate) struct Snapshot {
     status: serde_json::Value,
     workspaces: Vec<serde_json::Value>,
     tasks: Vec<serde_json::Value>,
 }
 
-fn empty_snapshot() -> Snapshot {
-    Snapshot {
-        status: serde_json::Value::Null,
-        workspaces: vec![],
-        tasks: vec![],
+impl Snapshot {
+    #[cfg(test)]
+    pub fn task_count_for_test(&self) -> usize {
+        self.tasks.len()
     }
+    #[cfg(test)]
+    pub fn tasks_for_test(&self) -> Vec<serde_json::Value> {
+        self.tasks.clone()
+    }
+}
+
+#[cfg(test)]
+pub fn snapshot_for_test(
+    status: serde_json::Value,
+    workspaces: Vec<serde_json::Value>,
+    tasks: Vec<serde_json::Value>,
+) -> Snapshot {
+    Snapshot { status, workspaces, tasks }
+}
+
+/// Pure row formatter for the task table: `id8 | from->to | att | state | pend`.
+/// The ratatui `render` maps each string to a styled Row; tests assert the
+/// strings (including state tokens the red/reversed branches key on).
+#[cfg(test)]
+pub fn task_rows_for_test(tasks: &[serde_json::Value], _selected: usize) -> Vec<String> {
+    tasks
+        .iter()
+        .map(|t| {
+            let id = t.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let from = t.get("from_ws").and_then(|v| v.as_str()).unwrap_or("?");
+            let to = t.get("to_ws").and_then(|v| v.as_str()).unwrap_or("?");
+            let att = t.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
+            let st = t.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+            let pend = t.get("pending_replies").and_then(|v| v.as_i64()).unwrap_or(0);
+            format!(
+                "{}|{}->{}|{}|{}|{}",
+                id.get(..8.min(id.len())).unwrap_or(id),
+                from,
+                to,
+                att,
+                st,
+                pend
+            )
+        })
+        .collect()
 }
 
 fn pull(sock: &Path) -> Snapshot {

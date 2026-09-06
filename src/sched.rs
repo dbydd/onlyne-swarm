@@ -444,8 +444,166 @@ fn close_terminal(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
         if h.starts_with("stub-") {
             return Ok(());
         }
-        // Best effort: kill pi; orca reclaims the terminal.
+        // Best effort: kill pi, then close the orca terminal tab.
+        // kill first (reclaims the pi process); close drops the tab even if
+        // the process already exited, so no orphan tabs accumulate in Orca.
         let _ = crate::orca_term::kill_pi(&h);
+        let _ = crate::orca_term::close(&h);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod sched_tests {
+    use super::*;
+    use crate::db::{Db, TaskState};
+
+    fn test_sched() -> Arc<Sched> {
+        let dir = tempfile::tempdir().unwrap();
+        // Db::open borrows root; keep dir alive via leak for test simplicity.
+        let root: &'static std::path::Path =
+            Box::leak(dir.path().join("root").into_boxed_path());
+        std::fs::create_dir_all(root).unwrap();
+        // Leak dir too so the tempdir is not deleted mid-test.
+        let _ = Box::leak(Box::new(dir));
+        let db = Db::open(root).unwrap();
+        Sched::new(root.to_path_buf(), db)
+    }
+
+    fn hdr(task_id: &str, reply_to: &str) -> crate::proto::SwarmHeader {
+        crate::proto::SwarmHeader {
+            task_id: task_id.into(),
+            from: ".".into(),
+            reply_to: reply_to.into(),
+            attempt: 1,
+        }
+    }
+
+    fn reply_msg(task_id: &str, reply_to: &str, payload: &str) -> crate::proto::SwarmMessage {
+        crate::proto::SwarmMessage {
+            header: hdr(task_id, reply_to),
+            payload: payload.into(),
+        }
+    }
+
+    /// Insert a task row directly (bypasses orca terminal creation).
+    fn seed(sched: &Arc<Sched>, task_id: &str, to: &str, reply_to: &str, state: TaskState) {
+        sched
+            .db
+            .insert_task(task_id, ".", to, reply_to, 1, "payload")
+            .unwrap();
+        sched.db.set_state(task_id, state).unwrap();
+    }
+
+    #[test]
+    fn reply_without_parent_closes_task() {
+        let s = test_sched();
+        seed(&s, "t1", "a", "", TaskState::Running);
+        on_reply(&s, "a", &reply_msg("t1", "", "done")).unwrap();
+        let t = s.db.get("t1").unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Closed);
+    }
+
+    #[test]
+    fn reply_forwards_callback_and_decrements_parent() {
+        let s = test_sched();
+        // Parent workspace dir must exist for the FIFO write; create a fake
+        // instance dir with a real fifo? write_loopback_in opens the fifo, so
+        // instead point parent at "." (root) -- still needs a fifo. Use a
+        // real FIFO via mkfifo through std::process? Simpler: create the
+        // parent in workspace "a" and pre-create root loopback fifo.
+        seed(&s, "parent", "a", "", TaskState::Running);
+        s.db.bump_parent("parent", 1).unwrap();
+        seed(&s, "child", "b", "parent", TaskState::Running);
+        // Pre-create the parent workspace loopback fifo so the forward lands.
+        let ws_a = crate::root::resolve_instance(&s.root, "a");
+        std::fs::create_dir_all(ws_a.join(".onlyne/channels/loopback")).unwrap();
+        let fifo = crate::root::loopback_in(&ws_a);
+        // SAFETY: test-only; create fifo via libc mknod through std.
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(&fifo);
+            // Use mkfifo(1); guaranteed on macOS/dev machines.
+            let st = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+            assert!(st.success());
+            // Hold a reader so the scheduler's O_WRONLY open never blocks.
+            let fifo2 = fifo.clone();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                loop {
+                    if let Ok(mut f) = std::fs::File::open(&fifo2) {
+                        let mut buf = Vec::new();
+                        let _ = f.read_to_end(&mut buf);
+                    } else {
+                        break;
+                    }
+                }
+            });
+        }
+        on_reply(&s, "b", &reply_msg("child", "parent", "child done")).unwrap();
+        let child = s.db.get("child").unwrap().unwrap();
+        assert_eq!(child.state, TaskState::Closed);
+        let parent = s.db.get("parent").unwrap().unwrap();
+        assert_eq!(parent.pending_replies, 0);
+    }
+
+    #[test]
+    fn duplicate_reply_is_idempotent() {
+        let s = test_sched();
+        seed(&s, "p", "a", "", TaskState::Running);
+        s.db.bump_parent("p", 1).unwrap();
+        seed(&s, "c", "b", "p", TaskState::Running);
+        let ws_a = crate::root::resolve_instance(&s.root, "a");
+        std::fs::create_dir_all(ws_a.join(".onlyne/channels/loopback")).unwrap();
+        // No fifo: forward would fail. Instead use parent == child ws trick?
+        // Simpler: point parent workspace at a dir WITH a drained fifo.
+        let fifo = crate::root::loopback_in(&ws_a);
+        let _ = std::fs::remove_file(&fifo);
+        let st = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(st.success());
+        let fifo2 = fifo.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            loop {
+                if let Ok(mut f) = std::fs::File::open(&fifo2) {
+                    let mut buf = Vec::new();
+                    let _ = f.read_to_end(&mut buf);
+                } else {
+                    break;
+                }
+            }
+        });
+        let msg = reply_msg("c", "p", "x");
+        on_reply(&s, "b", &msg).unwrap();
+        // Second identical delivery must be a no-op (no double decrement).
+        on_reply(&s, "b", &msg).unwrap();
+        let parent = s.db.get("p").unwrap().unwrap();
+        assert_eq!(parent.pending_replies, 0);
+    }
+
+    #[test]
+    fn unknown_reply_is_ignored() {
+        let s = test_sched();
+        on_reply(&s, "a", &reply_msg("ghost", "", "x")).unwrap();
+    }
+
+    #[test]
+    fn render_snapshot_shapes() {
+        let tasks = vec![
+            serde_json::json!({"task_id": "abcdefgh-1234", "from_ws": ".", "to_ws": "a",
+                               "attempt": 1, "state": "running", "pending_replies": 2}),
+            serde_json::json!({"task_id": "x", "from_ws": "a", "to_ws": "b",
+                               "attempt": 3, "state": "failed", "pending_replies": 0}),
+        ];
+        let snap = crate::tui::snapshot_for_test(
+            serde_json::Value::Null,
+            vec![],
+            tasks.clone(),
+        );
+        assert_eq!(snap.task_count_for_test(), 2);
+        let rows = crate::tui::task_rows_for_test(&snap.tasks_for_test(), 0);
+        assert_eq!(rows.len(), 2);
+        // Failed row keeps its state string for the red style branch.
+        assert!(rows[1].contains("failed"));
+    }
 }

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 /// A managed `onlyne run` child for one workspace.
 pub struct Managed {
+    #[allow(dead_code)]
     pub workspace: String,
     pub child: Child,
 }
