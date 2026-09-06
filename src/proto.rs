@@ -2,12 +2,15 @@ use serde::{Deserialize, Serialize};
 
 /// Swarm envelope carried inside the message body (upper-layer protocol).
 /// Wire form is `---swarm\n<yaml>\n---\n<markdown>` (see PROTOCOL.md).
+/// `transfer_send_to` is lineage only: which task spawned this one. It
+/// carries no routing or waiting semantics (SPEC-AMENDMENT-1). Old
+/// `reply_to` headers are not recognized and parse as ordinary messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmHeader {
     pub task_id: String,
     pub from: String,
     #[serde(default)]
-    pub reply_to: String,
+    pub transfer_send_to: String,
     #[serde(default = "default_attempt")]
     pub attempt: u32,
 }
@@ -49,7 +52,7 @@ fn serde_yaml_safe_parse(raw: &str) -> Option<SwarmHeader> {
     // Minimal YAML-subset parser: `key: value` lines only. No new dependency.
     let mut task_id = None;
     let mut from = None;
-    let mut reply_to = String::new();
+    let mut transfer_send_to = String::new();
     let mut attempt = 1u32;
     for line in raw.lines() {
         let line = line.trim();
@@ -61,7 +64,7 @@ fn serde_yaml_safe_parse(raw: &str) -> Option<SwarmHeader> {
         match k.trim() {
             "task_id" => task_id = Some(v),
             "from" => from = Some(v),
-            "reply_to" => reply_to = v,
+            "transfer_send_to" => transfer_send_to = v,
             "attempt" => attempt = v.parse().unwrap_or(1),
             _ => {}
         }
@@ -69,7 +72,7 @@ fn serde_yaml_safe_parse(raw: &str) -> Option<SwarmHeader> {
     Some(SwarmHeader {
         task_id: task_id?,
         from: from.unwrap_or_else(|| ".".into()),
-        reply_to,
+        transfer_send_to,
         attempt,
     })
 }
@@ -78,7 +81,7 @@ pub fn render(header: &SwarmHeader, role: &str, payload_markdown: &str) -> Strin
     let mut s = String::from("---swarm\n");
     s.push_str(&format!("task_id: {}\n", header.task_id));
     s.push_str(&format!("from: {}\n", header.from));
-    s.push_str(&format!("reply_to: {}\n", header.reply_to));
+    s.push_str(&format!("transfer_send_to: {}\n", header.transfer_send_to));
     s.push_str(&format!("attempt: {}\n", header.attempt));
     s.push_str("---\n");
     if !role.is_empty() {
@@ -91,12 +94,15 @@ pub fn render(header: &SwarmHeader, role: &str, payload_markdown: &str) -> Strin
     s
 }
 
-pub fn failed_payload(reason: &str, body: &str) -> String {
-    format!("> swarm-failed: {reason}\n\n{body}")
+/// Marker prefixes for ledger `reason` fields. Failure/cancel reasons travel
+/// in the ledger row, not in a callback message body (amendment-1: there are
+/// no callbacks). Kept as helpers so reason strings stay uniform.
+pub fn failed_reason(reason: &str) -> String {
+    format!("swarm-failed: {reason}")
 }
 
-pub fn cancelled_payload(reason: &str, body: &str) -> String {
-    format!("> swarm-cancelled: {reason}\n\n{body}")
+pub fn cancelled_reason(reason: &str) -> String {
+    format!("swarm-cancelled: {reason}")
 }
 
 #[cfg(test)]
@@ -107,7 +113,7 @@ mod tests {
         let h = SwarmHeader {
             task_id: uuid::Uuid::new_v4().to_string(),
             from: "planner".into(),
-            reply_to: String::new(),
+            transfer_send_to: String::new(),
             attempt: 1,
         };
         let text = render(&h, "planner role", "do X");

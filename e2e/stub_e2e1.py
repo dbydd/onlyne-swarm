@@ -1,10 +1,11 @@
-"""E2E-1 stub agent: single task claim -> reply -> exit.
+"""E2E-1 stub agent: single task claim -> out -> exit.
 
 Usage: stub_e2e1.py <workspace_abs> <tree_path> <handle> <marker>
 
 Claims the newest inbound ---swarm task whose body contains <marker>
 (so parallel runs on one tree do not steal each other's tasks),
-replies with a fixed body, exits 0 on success, 1 on timeout/failure.
+writes the out message (done signal), exits 0 on success, 1 on timeout.
+Fire-and-forget: no waiting for anything downstream.
 """
 import os
 import sys
@@ -30,10 +31,10 @@ if not text:
     print("TIMEOUT waiting for task", flush=True)
     sys.exit(1)
 print("TASK:", text[:300].replace("\n", " | "), flush=True)
-task_id, reply_to = header_fields(text)
+task_id, transfer = header_fields(text)
 if not task_id:
     print("NO task_id in task", flush=True)
     sys.exit(1)
-ok = reply_task(ws, tree_path, task_id, reply_to or "",
+ok = reply_task(ws, tree_path, task_id, transfer or "",
                 f"stub reply from {tree_path}")
 sys.exit(0 if ok else 1)

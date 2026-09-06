@@ -23,10 +23,10 @@ pub async fn serve(root: &Path) -> anyhow::Result<()> {
         crate::db::Db::open(root)?,
     );
     // Reap orphan pending tasks from a previous run: terminals are gone,
-    // so they count as early exits (failure callbacks, no replay).
+    // so they count as early exits (failed ledger rows, no replay).
     reap_previous_run(&sched);
     let listener = UnixListener::bind(&sock)?;
-    // Spawn the daemon event-subscription pump (priority consumer on each onlyne.sock).
+    // Spawn the daemon event-subscription pump (priority consumer on each run/s).
     {
         let s = sched.clone();
         std::thread::spawn(move || crate::events::pump(s));
@@ -129,7 +129,7 @@ fn handle_conn(sched: Arc<Sched>, stream: UnixStream) -> anyhow::Result<()> {
                     "root": sched.root.to_string_lossy(),
                     "workspaces": tree.len(),
                     "tasks_by_state": counts,
-                    "dead_letters": sched.db.dead_letters(20).unwrap_or_default().len(),
+                    "ledger_tail": sched.db.ledger(20).unwrap_or_default(),
                 });
                 write_resp(&mut writer, &id, true, Some(data), None)?;
             }

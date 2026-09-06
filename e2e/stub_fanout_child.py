@@ -1,4 +1,4 @@
-"""E2E-2 fanout child stub: claim one swarm-child task -> reply -> exit.
+"""E2E-2 fanout child stub: claim one swarm-child task -> out -> exit.
 
 Usage: stub_fanout_child.py <workspace_abs> <tree_path> <handle> <marker>
 
@@ -27,10 +27,10 @@ if not text:
     print("TIMEOUT waiting for child task", flush=True)
     sys.exit(1)
 print("CHILD TASK:", text[:200].replace("\n", " | "), flush=True)
-task_id, reply_to = header_fields(text)
+task_id, transfer = header_fields(text)
 if not task_id:
     print("NO task_id in child task", flush=True)
     sys.exit(1)
-ok = reply_task(ws, tree_path, task_id, reply_to or "",
+ok = reply_task(ws, tree_path, task_id, transfer or "",
                 f"stub reply from {tree_path}")
 sys.exit(0 if ok else 1)

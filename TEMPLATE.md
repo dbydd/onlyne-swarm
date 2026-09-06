@@ -5,7 +5,7 @@
 - 调度输入：`<root>/.agents/.schedule/<名>/template.workspace.jsonc`，
   子目录嵌套即子 workspace（`<名>/<子名>/template.workspace.jsonc`）。
   子目录名即 workspace 名。文件名全树统一为 `template.workspace.jsonc`。
-- 手写覆盖：对应真实实例 `<root>/_onlyne_workspaces/<嵌套路径>/.onlyne/swarm.workspace.jsonc`，
+- 手写覆盖：对应真实实例 `<root>/.ws/<嵌套路径>/.onlyne/swarm.workspace.jsonc`，
   主要用途是手写跨层回边与实例级微调。调度器永不重写该文件；实例不存在时按合并结果生成。
 - root 自身的描述：`<root>/.agents/.schedule` 的父级即 root workspace，
   root 的模板字段直接写在 `<root>/.onlyne/swarm.workspace.jsonc`（不存在则视为 `{}`）。
@@ -46,7 +46,7 @@
 `onlyne-swarm workspace create|sync` 与 `run` 启动时的自动 sync：
 
 1. 遍历 `.agents/.schedule` 树，逐层合并得到每个 workspace 的 effective 描述；
-2. 对缺失的 `_onlyne_workspaces/<路径>/` 创建目录，并写入
+2. 对缺失的 `.ws/<路径>/` 创建目录，并写入
    `.onlyne/config.toml`（loopback 专精 + `[swarm] enabled = true`）、
    `.onlyne/swarm.workspace.jsonc`（= effective 描述快照）、`channels/loopback/` 空位；
 3. 已存在的实例目录：只刷新 `onlyne_in/` 软链，不覆盖 `config.toml` 与
@@ -63,7 +63,7 @@
 .agents/.schedule/planner/template.workspace.jsonc
 .agents/.schedule/planner/worker/template.workspace.jsonc
 .agents/.schedule/reviewer/template.workspace.jsonc
-_onlyne_workspaces/planner/
-_onlyne_workspaces/planner/worker/
-_onlyne_workspaces/reviewer/
+.ws/planner/
+.ws/planner/worker/
+.ws/reviewer/
 ```

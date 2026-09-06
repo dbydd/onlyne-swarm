@@ -1,11 +1,12 @@
-"""E2E-3 loop stub: forward each loop task to the peer with counter+1, then reply.
+"""E2E-3 loop stub: forward each loop task to the peer, then out, loop forever.
 
 Usage: stub_loop.py <workspace_abs> <tree_path> <handle> <peer_tree_path> <e2e_root>
 
 Runs until killed. Only loop tasks participate: a task is a loop task iff its
-body carries `loop-n=` or `loop-seed` (plain top-level tasks it did not start
-are still answered once so the seed chain boots, but callbacks -- inbound
-tasks with a reply_to and no loop marker -- are never forwarded).
+body carries `loop-n=` or `loop-seed` and is not already a stub reply.
+Each hop forwards one new task to the peer (transfer_send_to = this task,
+lineage only) and immediately writes its own out. Nothing waits for anything:
+the loop advances because every hop exits right after spawning the next.
 """
 import os
 import sys
@@ -32,11 +33,11 @@ while True:
         t = m.get("text") or ""
         if not t.startswith("---swarm") or m.get("direction") != "inbound":
             continue
-        tid, reply_to = header_fields(t)
+        tid, transfer = header_fields(t)
         if not tid or tid in seen or "stub reply" in t:
             continue
-        if "loop-n=" not in t and "loop-seed" not in t and reply_to:
-            continue  # callbacks, not loop tasks
+        if "loop-n=" not in t and "loop-seed" not in t:
+            continue
         seen.add(tid)
         n = -1
         for line in t.split("\n"):
@@ -48,15 +49,15 @@ while True:
         n += 1
         cid = str(uuid.uuid4())
         body = (f"---swarm\ntask_id: {cid}\nfrom: {tree_path}\n"
-                f"reply_to: {tid}\nattempt: 1\n---\n"
+                f"transfer_send_to: {tid}\nattempt: 1\n---\n"
                 f"loop-n={n} ping from {tree_path}\n")
-        fifo = os.path.join(e2e_root, "_onlyne_workspaces", peer,
+        fifo = os.path.join(e2e_root, ".ws", peer,
                             ".onlyne/channels/loopback/in")
         fd = os.open(fifo, os.O_WRONLY)
         os.write(fd, body.encode())
         os.close(fd)
         print(f"fwd {tid[:8]} -> {peer} loop-n={n} as {cid[:8]}", flush=True)
-        reply_task(ws, tree_path, tid, reply_to or "",
+        reply_task(ws, tree_path, tid, transfer or "",
                    f"stub reply loop-n={n} from {tree_path}")
         print(f"replied {tid[:8]}", flush=True)
     time.sleep(1.0)

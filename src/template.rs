@@ -287,9 +287,9 @@ mod tests {
             r#"{"role": "r"}"#,
         )
         .unwrap();
-        std::fs::create_dir_all(root.join("_onlyne_workspaces/a/.onlyne")).unwrap();
+        std::fs::create_dir_all(root.join(".ws/a/.onlyne")).unwrap();
         std::fs::write(
-            root.join("_onlyne_workspaces/a/.onlyne/swarm.workspace.jsonc"),
+            root.join(".ws/a/.onlyne/swarm.workspace.jsonc"),
             r#"{"role": "hand"}"#,
         )
         .unwrap();

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::sched::{self, Sched};
 
-/// Subscribe to every workspace daemon's `onlyne.sock` at top priority and
+/// Subscribe to every workspace daemon's `run/s` at top priority and
 /// route swarm traffic. Runs on a plain thread (blocking sockets), one
 /// connection per workspace daemon, with reconnect on drop.
 pub fn pump(sched: Arc<Sched>) {
@@ -88,8 +88,8 @@ fn route_event(
                 .unwrap_or("");
             if let Some(msg) = crate::proto::parse(text) {
                 consumed_ack(stream, v);
-                if let Err(e) = sched::on_reply(sched, ws_path, &msg) {
-                    tracing::warn!(error = %e, "on_reply failed");
+                if let Err(e) = sched::on_out(sched, ws_path, &msg) {
+                    tracing::warn!(error = %e, "on_out failed");
                 }
             }
         }
@@ -138,7 +138,7 @@ fn tree_path_for(sched: &Arc<Sched>, abs: &str) -> Option<String> {
 }
 
 fn tree_path_for_root(root: &str, abs_c: &str) -> Option<String> {
-    let inst = format!("{root}/_onlyne_workspaces/");
+    let inst = format!("{root}/.ws/");
     if abs_c == root || abs_c == format!("{root}/") {
         return Some(".".into());
     }
@@ -162,7 +162,7 @@ fn on_task_inbound(sched: &Arc<Sched>, ws_path: &str, msg: &crate::proto::SwarmM
             &msg.header.task_id,
             &msg.header.from,
             to,
-            &msg.header.reply_to,
+            &msg.header.transfer_send_to,
             msg.header.attempt,
             &msg.payload,
         )
@@ -170,10 +170,8 @@ fn on_task_inbound(sched: &Arc<Sched>, ws_path: &str, msg: &crate::proto::SwarmM
     if !inserted {
         return; // Duplicate delivery: drop.
     }
-    // Parent bookkeeping: a new child means +1 pending on the parent.
-    if !msg.header.reply_to.is_empty() {
-        let _ = sched.db.bump_parent(&msg.header.reply_to, 1);
-    }
+    // Fire-and-forget: no parent bookkeeping, no pending counter.
+    // Every inbound task spawns its own session downstream.
     sched.emit(
         "task_created",
         serde_json::json!({"task_id": msg.header.task_id, "from": msg.header.from, "to": to}),
@@ -206,11 +204,11 @@ mod tests {
         assert_eq!(tree_path_for_root("/r", "/r/"), Some(".".into()));
         // Nested instances.
         assert_eq!(
-            tree_path_for_root("/r", "/r/_onlyne_workspaces/a"),
+            tree_path_for_root("/r", "/r/.ws/a"),
             Some("a".into())
         );
         assert_eq!(
-            tree_path_for_root("/r", "/r/_onlyne_workspaces/a/b/"),
+            tree_path_for_root("/r", "/r/.ws/a/b/"),
             Some("a/b".into())
         );
         // Tree-relative input passes through (tests, supervisor submits).

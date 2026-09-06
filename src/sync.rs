@@ -49,7 +49,7 @@ pub struct SyncReport {
     pub workspaces: usize,
 }
 
-/// Generate `_onlyne_workspaces` from `.agents/.schedule`.
+/// Generate `.ws` from `.agents/.schedule`.
 ///
 /// - Missing instance dirs are created with loopback-only config + effective snapshot.
 /// - Existing instances: config and `swarm.workspace.jsonc` are never overwritten;
@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(rep.workspaces, 2);
         assert!(rep.created.iter().any(|c| c == "a"));
         let cfg = std::fs::read_to_string(
-            root.join("_onlyne_workspaces/a/.onlyne/config.toml"),
+            root.join(".ws/a/.onlyne/config.toml"),
         )
         .unwrap();
         assert!(cfg.contains("[swarm]"));
@@ -201,17 +201,17 @@ mod tests {
         assert!(link.is_symlink());
         // A's view links back to root ("_root").
         assert!(root
-            .join("_onlyne_workspaces/a/onlyne_in/_root")
+            .join(".ws/a/onlyne_in/_root")
             .is_symlink());
         // Hand-written overlay preserved on re-sync.
         std::fs::write(
-            root.join("_onlyne_workspaces/a/.onlyne/swarm.workspace.jsonc"),
+            root.join(".ws/a/.onlyne/swarm.workspace.jsonc"),
             r#"{"role": "mine"}"#,
         )
         .unwrap();
         run_sync(root).unwrap();
         let snap = std::fs::read_to_string(
-            root.join("_onlyne_workspaces/a/.onlyne/swarm.workspace.jsonc"),
+            root.join(".ws/a/.onlyne/swarm.workspace.jsonc"),
         )
         .unwrap();
         assert!(snap.contains("mine"));
@@ -221,9 +221,9 @@ mod tests {
     fn orphan_instances_are_reported_not_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::create_dir_all(root.join("_onlyne_workspaces/ghost/.onlyne")).unwrap();
+        std::fs::create_dir_all(root.join(".ws/ghost/.onlyne")).unwrap();
         let rep = run_sync(root).unwrap();
         assert!(rep.orphans.iter().any(|o| o == "ghost"));
-        assert!(root.join("_onlyne_workspaces/ghost").exists());
+        assert!(root.join(".ws/ghost").exists());
     }
 }

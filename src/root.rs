@@ -7,12 +7,12 @@ pub fn cwd_root(cwd: &Path) -> PathBuf {
 }
 
 /// Refuse to start a scheduler in a nested directory: any ancestor containing
-/// `_onlyne_workspaces` or `.onlyne/swarm.db` means we are inside another tree.
+/// `.ws` or `.onlyne/swarm.db` means we are inside another tree.
 pub fn ensure_root(cwd: &Path, force: bool) -> anyhow::Result<PathBuf> {
     if !force {
         let mut cur = cwd.to_path_buf();
         loop {
-            if cur.join("_onlyne_workspaces").is_dir() || cur.join(".onlyne/swarm.db").exists() {
+            if cur.join(".ws").is_dir() || cur.join(".onlyne/swarm.db").exists() {
                 if cur != cwd {
                     bail!(
                         "nested swarm start refused: {} is inside swarm tree at {}. Run `onlyne-swarm attach` there, or start at the root, or pass --force",
@@ -38,7 +38,7 @@ pub fn schedule_dir(root: &Path) -> PathBuf {
 }
 
 pub fn instances_dir(root: &Path) -> PathBuf {
-    root.join("_onlyne_workspaces")
+    root.join(".ws")
 }
 
 pub fn swarm_db(root: &Path) -> PathBuf {
@@ -64,7 +64,7 @@ pub fn loopback_in(ws_root: &Path) -> PathBuf {
 }
 
 pub fn onlyne_sock(ws_root: &Path) -> PathBuf {
-    ws_root.join(".onlyne/run/onlyne.sock")
+    ws_root.join(".onlyne/run/s")
 }
 
 pub fn swarm_ws_config(ws_root: &Path) -> PathBuf {
@@ -84,8 +84,8 @@ mod tests {
     fn nested_start_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
-        std::fs::create_dir_all(root.join("_onlyne_workspaces")).unwrap();
-        let child = root.join("_onlyne_workspaces/a");
+        std::fs::create_dir_all(root.join(".ws")).unwrap();
+        let child = root.join(".ws/a");
         std::fs::create_dir_all(&child).unwrap();
         let err = ensure_root(&child, false).unwrap_err();
         assert!(err.to_string().contains("nested swarm start refused"));

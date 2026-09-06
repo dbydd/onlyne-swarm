@@ -88,7 +88,7 @@ onlyne-swarm workspace create
 onlyne-swarm workspace sync
 ```
 
-The generated tree contains `_onlyne_workspaces/`, local `.onlyne/` state, and `onlyne_in/` symlinks. Runtime state stays under the selected swarm root.
+The generated tree contains `.ws/`, local `.onlyne/` state, and `onlyne_in/` symlinks. Runtime state stays under the selected swarm root.
 
 ## Start and submit
 
@@ -189,6 +189,14 @@ E2E_ROOT=/tmp/swarm-e2e-check ./e2e/run_e2e.sh all
 ```
 
 The stub suite covers a single chain, sequential fan-out, concurrent fan-out, a self-exciting cycle, and cancellation. Real Orca and Pi sessions require the runtime prerequisites above and a configured model provider.
+
+## Migration from 0.1.x
+
+0.2.0 breaks the wire protocol (`transfer_send_to` replaces `reply_to`),
+the database schema (no `pending_replies`, no dead-letter table), and the
+pi-onlyne tool surface. Old instance directories are not migrated: delete
+`.ws/` and `.onlyne/swarm.db`, then run `workspace create` again.
+Upgrade pi-onlyne to 0.7.0 in lockstep.
 
 ## Release checks
 

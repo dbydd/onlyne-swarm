@@ -84,7 +84,7 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum WorkspaceCmd {
-    /// Generate _onlyne_workspaces from .agents/.schedule
+    /// Generate .ws from .agents/.schedule
     Create,
     /// Same as create (reconcile; never deletes instances or hand-written files)
     Sync,

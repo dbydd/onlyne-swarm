@@ -3,6 +3,10 @@
 Each stub speaks the workspace daemon's Unix-socket JSON protocol directly:
 ping -> swarm_ready handshake -> poll loopback history -> reply via
 send_message to the loopback channel. No pi / model / orca needed.
+
+Amendment-1: fire-and-forget. `transfer_send_to` is lineage only
+(which task spawned this one). There are no callbacks, no waiting, no
+parent bookkeeping. Each hop completes (out) and exits immediately.
 """
 import json
 import os
@@ -12,7 +16,7 @@ import time
 
 
 def daemon_sock(ws):
-    return os.path.join(ws, ".onlyne/run/onlyne.sock")
+    return os.path.join(ws, ".onlyne/run/s")
 
 
 def rpc(ws, req, recv_bytes=65536):
@@ -58,21 +62,22 @@ def fetch_loopback(ws, limit=20):
 
 
 def header_fields(text):
-    """Parse a ---swarm header. Returns (task_id, reply_to) or (None, None)."""
+    """Parse a ---swarm header. Returns (task_id, transfer_send_to) or (None, None)."""
     task_id = None
-    reply_to = None
+    transfer = None
     for line in text.split("\n"):
         if line.startswith("task_id:"):
             task_id = line.split(":", 1)[1].strip()
-        elif line.startswith("reply_to:"):
-            reply_to = line.split(":", 1)[1].strip()
-    return task_id, reply_to
+        elif line.startswith("transfer_send_to:"):
+            transfer = line.split(":", 1)[1].strip()
+    return task_id, transfer
 
 
-def reply_task(ws, tree_path, task_id, reply_to, body_text):
+def reply_task(ws, tree_path, task_id, transfer_send_to, body_text):
+    """Write the out message for one hop: done signal, then exit. No waiting."""
     body = (
         f"---swarm\ntask_id: {task_id}\nfrom: {tree_path}\n"
-        f"reply_to: {reply_to}\nattempt: 1\n---\n{body_text}\n"
+        f"transfer_send_to: {transfer_send_to}\nattempt: 1\n---\n{body_text}\n"
     )
     r = rpc(ws, {
         "id": "s",

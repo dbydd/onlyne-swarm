@@ -57,7 +57,7 @@ pub fn snapshot_for_test(
     Snapshot { status, workspaces, tasks }
 }
 
-/// Pure row formatter for the task table: `id8 | from->to | att | state | pend`.
+/// Pure row formatter for the task table: `id8 | from->to | att | state | xfer8`.
 /// The ratatui `render` maps each string to a styled Row; tests assert the
 /// strings (including state tokens the red/reversed branches key on).
 #[cfg(test)]
@@ -70,7 +70,7 @@ pub fn task_rows_for_test(tasks: &[serde_json::Value], _selected: usize) -> Vec<
             let to = t.get("to_ws").and_then(|v| v.as_str()).unwrap_or("?");
             let att = t.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
             let st = t.get("state").and_then(|v| v.as_str()).unwrap_or("?");
-            let pend = t.get("pending_replies").and_then(|v| v.as_i64()).unwrap_or(0);
+            let xfer = t.get("transfer_send_to").and_then(|v| v.as_str()).unwrap_or("");
             format!(
                 "{}|{}->{}|{}|{}|{}",
                 id.get(..8.min(id.len())).unwrap_or(id),
@@ -78,7 +78,7 @@ pub fn task_rows_for_test(tasks: &[serde_json::Value], _selected: usize) -> Vec<
                 to,
                 att,
                 st,
-                pend
+                xfer.get(..8.min(xfer.len())).unwrap_or(xfer),
             )
         })
         .collect()
@@ -242,7 +242,7 @@ fn render(
             let to = t.get("to_ws").and_then(|v| v.as_str()).unwrap_or("?");
             let att = t.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0);
             let st = t.get("state").and_then(|v| v.as_str()).unwrap_or("?");
-            let pend = t.get("pending_replies").and_then(|v| v.as_i64()).unwrap_or(0);
+            let xfer = t.get("transfer_send_to").and_then(|v| v.as_str()).unwrap_or("");
             let style = if i == selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else if st == "failed" {
@@ -255,7 +255,7 @@ fn render(
                 format!("{from}->{to}"),
                 att.to_string(),
                 st.to_string(),
-                pend.to_string(),
+                xfer.get(..8.min(xfer.len())).unwrap_or(xfer).to_string(),
             ])
             .style(style)
         })
@@ -265,11 +265,11 @@ fn render(
         Constraint::Min(12),
         Constraint::Length(4),
         Constraint::Length(10),
-        Constraint::Length(6),
+        Constraint::Length(9),
     ];
     f.render_widget(
         Table::new(rows, widths)
-            .header(Row::new(vec!["task", "from->to", "att", "state", "pend"]))
+            .header(Row::new(vec!["task", "from->to", "att", "state", "xfer"]))
             .block(Block::default().title("tasks").borders(Borders::ALL)),
         right[0],
     );

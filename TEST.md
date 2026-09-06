@@ -1,49 +1,47 @@
-# 验证场景（TEST）
+# 验证场景（TEST，修订一 2026-09-06）
 
-脚手架完成后按顺序跑通三个端到端场景。测试树统一建在临时目录（非本仓库），
-root 下 `.agents/.schedule/{a,b}/template.workspace.jsonc`，role 为回显固定文本，
-model 指向本地可用的 pi 模型。
+射后不理模型：任务 = session = 一跳。每跳 out 即 done 并退出，无等待、无回调、
+无记账。测试树统一建在临时目录（非本仓库），root 下
+`.agents/.schedule/{a,b}/template.workspace.jsonc`。
 
-> 2026-09-06 实测状态：三场景已用 headless stub agent（`SWARM_STUB_AGENT=1` +
-> python 驱动 `swarm_ready` / history 轮询 / `send_message` 回复）全跑通；真实 Orca + pi + pi-onlyne session 已验证 terminal 创建、本地 dev 扩展加载、`swarm_ready`
-> 和 payload 投递入 workspace history。最终模型 reply 依赖可用的模型 provider，本次未把
-> 模型输出冒充协议回调。stub 脚本见本仓库 `e2e/` 目录，一键复跑 `./e2e/run_e2e.sh all`。
-> 实测中修掉的真 bug：事件嵌套 envelope 未解包、`/tmp` vs `/private/tmp`
-> 路径映射、并发回调 FIFO 合并丢失（进程级写锁）、重复投递二次转发
->（终态守卫）。回放时注意先清残留 daemon（`--workspace` 用 canonical 路径匹配
-> pkill）与残留 stub 进程。
+> 实测状态：五场景已用 headless stub agent（`SWARM_STUB_AGENT=1` + python 驱动
+> `swarm_ready` / history 轮询 / `send_message` 写 out）全跑通。stub 脚本见本仓库
+> `e2e/` 目录，一键复跑 `./e2e/run_e2e.sh all`。
+> 旧 `reply_to` 头按普通消息处理，不建 session。
 
-## 1. 单链双节点（submit → ready → 投递 → 回调 → 回收）
+## 1. 单链单跳（submit → ready → 投递 → out → 回收）
 
-1. `onlyne-swarm run` 启动，`sync` 生成 `_onlyne_workspaces/a`，daemon 上线。
+1. `onlyne-swarm run` 启动，`sync` 生成 `.ws/a`，daemon 上线。
 2. `onlyne-swarm submit --to a --payload task1.md` 返回 `task_id`。
 3. 断言：a 的 terminal 建立，`swarm_ready` 到达后 loopback/in 收到带 swarm 头的任务；
-   pi 回复写出 out 后调度器转发回调到 root；root 收到回调；
-   a 的 terminal 回收（orca 侧无残留），任务状态 `closed`。
-4. `onlyne-swarm list --tasks` 全 `closed`，`status` 无 orphan/dangling。
+   stub 写出 out 后任务状态 `done` → `closed`，terminal 回收（orca 侧无残留），
+   ledger 追加一行 done。
+4. `onlyne-swarm list` 全 `closed`，`status` 无 orphan/dangling。
 
-## 2. 一发多收扇出（pending_replies 记账）
+## 2. 一发多收扇出（零记账）
 
-1. root 提交父任务到 a，a 的 role 要求它向 b 与 c 各发一个子任务后汇总。
-2. 断言：父 task `pending_replies` 经历 `0 → 2 → 1 → 0`；
-   两个子回调都转发回 a 的同一挂起 session（followUp 插入）；
-   父 out 写出后 terminal 回收；三个任务全 `closed`。
-
-## 2b. 并发回调（FIFO 写锁回归）
-
-1. 父任务扇出两个子任务，子任务无延迟同时回复。
-2. 断言：两个回调都到达父 workspace（无合并丢失），父 `pending_replies`
-   归零，父子全 `closed`。无写锁时此场景稳定复现丢一个回调。
+1. root 提交父任务到 a，a 激发 b 与 c 各一个子任务后立即 out 退出。
+2. 断言：父 out 落地即 done，与子女状态无关；三个任务各自 `closed`；
+   ledger 三行（父 done + 两子 done），`transfer_send_to` 指向父 task。
+3. 并发版（race，子任务零延迟同时 out）同样全 closed；无写锁、无合并丢失概念。
 
 ## 3. 回边自激发循环（环路 + 手动终结）
 
-1. a 与 b 的 `back_edges` 互指，对方收到任务即回发新任务（role 约定，载荷递增计数器）。
-2. 断言：任务族持续增长，TUI 任务表滚动，`status` 计数告警标红但运行不受干扰。
-3. `onlyne-swarm cancel <族task_id>` 后：两 terminal 回收，发起方收到 cancelled 回调，
-   无新任务产生，TUI 无残留 running。
+1. a 与 b 的 `back_edges` 互指，对方收到任务即激发新任务（载荷递增计数器）后 out 退出。
+2. 断言：任务数线性增长，terminal 随起随收，无钉死 session；
+   TUI 任务表滚动，族深度计数告警标红但运行不受干扰。
+3. `onlyne-swarm cancel <族task_id>` 后：全族 cancelled，无新任务产生，
+   TUI 无残留 running，ledger 追加 cancelled 行。
 
-## 4. 通用断言（每场景）
+## 4. 同 workspace 并行
+
+1. 向同一 workspace 提交两个任务。
+2. 断言：两 terminal 并存，各自 out 后 closed，互不阻塞。
+
+## 5. 通用断言（每场景）
 
 - `task_id` 唯一，无重复投递建双 session。
 - 无 swarm 头的消息不建 session（普通 loopback 行为不变）。
-- 调度器重启后 pending 任务继续，丢失 terminal 的任务走失败回调。
+- 带旧 `reply_to` 头的消息按普通消息处理。
+- 调度器重启后 running 任务记 failed 台账行，任务不重放。
+- 普通模式 session 看不到 swarm_* 工具；swarm 模式 session 看不到通用收发工具。

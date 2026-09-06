@@ -17,7 +17,7 @@ set -euo pipefail
 E2E_ROOT="${E2E_ROOT:-$PWD/.e2e-tree}"
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ONLYNE_BIN="${ONLYNE_BIN:-$(cd "$REPO/../../.." && pwd)/target/debug/onlyne}"
-SWARM_BIN="${SWARM_BIN:-$REPO/../target/debug/onlyne-swarm}"
+SWARM_BIN="${SWARM_BIN:-$(cd "$REPO/.." && pwd)/target/debug/onlyne-swarm}"
 MARK="run-$$-$(date +%s)"
 
 log() { echo "[e2e] $*"; }
@@ -98,7 +98,7 @@ submit() { # submit <to> <marker_text> -> task_id
 }
 
 wsdir() { # wsdir <tree_path> -> abs workspace dir
-  if [[ "$1" == "." ]]; then echo "$E2E_ROOT"; else echo "$E2E_ROOT/_onlyne_workspaces/$1"; fi
+  if [[ "$1" == "." ]]; then echo "$E2E_ROOT"; else echo "$E2E_ROOT/.ws/$1"; fi
 }
 
 e2e1() {
@@ -120,11 +120,20 @@ e2e2() { # e2e2 <gap> <name>
   python3 "$REPO/stub_fanout_child.py" "$(wsdir b)" b "chb-$MARK" "$MARK" &
   python3 "$REPO/stub_fanout_child.py" "$(wsdir c)" c "chc-$MARK" "$MARK" &
   wait_state "${id:0:8}" closed 180 || die "E2E-2 parent $id not closed (state=$(task_state "${id:0:8}"))"
-  local pend; pend=$(cd "$E2E_ROOT" && swarm list 2>/dev/null | python3 -c "
-import json,sys
-for t in json.load(sys.stdin)['data']:
-    if t['task_id'] == '$id': print(t['pending_replies']); break")
-  [[ "$pend" == "0" ]] || die "E2E-2 parent pending_replies=$pend, want 0"
+  # Fire-and-forget: the parent is done as soon as its own out lands.
+  # Children are independent tasks; each stub exits right after its own out,
+  # but their out events may still be in flight when the parent closes.
+  # Poll until all three tasks reach a terminal state.
+  local end=$((SECONDS + 120))
+  while ((SECONDS < end)); do
+    local done; done=$(cd "$E2E_ROOT" && swarm list --state done 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
+    local closed; closed=$(cd "$E2E_ROOT" && swarm list --state closed 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
+    ((done + closed >= 3)) && break
+    sleep 2
+  done
+  local done; done=$(cd "$E2E_ROOT" && swarm list --state done 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
+  local closed; closed=$(cd "$E2E_ROOT" && swarm list --state closed 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
+  ((done + closed >= 3)) || die "E2E-2 expected parent+2 children terminal (done=$done closed=$closed)"
   log "E2E-2 ($2) PASS"
 }
 
@@ -132,7 +141,7 @@ e2e3() {
   log "E2E-3 back-edge self-exciting loop + cancel"
   mktree 0; start_sched
   # hand-written overlay: a -> b closes the ring (b -> a already in template)
-  python3 - "$E2E_ROOT/_onlyne_workspaces/a/.onlyne/swarm.workspace.jsonc" <<'PY'
+  python3 - "$E2E_ROOT/.ws/a/.onlyne/swarm.workspace.jsonc" <<'PY'
 import json,sys
 p = sys.argv[1]
 d = json.load(open(p)); d["back_edges"] = ["b"]

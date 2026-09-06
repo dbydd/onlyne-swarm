@@ -1,17 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
-
-/// Process-wide serializer for loopback/in FIFO writes. Concurrent O_WRONLY
-/// opens to the same FIFO can merge at the daemon's read boundary and lose a
-/// message; the scheduler must never lose a callback, so all its FIFO writes
-/// go through this lock. (Agents themselves may still write concurrently;
-/// that risk is explicitly ignored per SPEC.)
-static FIFO_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-fn fifo_lock() -> &'static Mutex<()> {
-    FIFO_WRITE_LOCK.get_or_init(|| Mutex::new(()))
-}
 
 /// Scheduler events fanned out to swarm.sock `subscribe` clients and the TUI.
 #[derive(Debug, Clone)]
@@ -231,7 +221,7 @@ fn deliver_to_terminal(
     let header = crate::proto::SwarmHeader {
         task_id: task_id.into(),
         from: task.from_ws.clone(),
-        reply_to: task.reply_to.clone(),
+        transfer_send_to: task.transfer_send_to.clone(),
         attempt: task.attempt,
     };
     let wire = crate::proto::render(&header, &role, &task.payload);
@@ -250,8 +240,8 @@ fn deliver_to_terminal(
 fn write_loopback_in(ws: &std::path::Path, text: &str) -> anyhow::Result<()> {
     // `in` is a real FIFO owned by the workspace daemon: open-write-close
     // delivers one message (EOF ends the message). Never create it here.
-    // Serialized process-wide: see FIFO_WRITE_LOCK.
-    let _guard = fifo_lock().lock().unwrap();
+    // Fire-and-forget per hop: no cross-hop write lock (amendment-1 removes
+    // the callback path that made coalesced writes fatal).
     use std::io::Write;
     let p = crate::root::loopback_in(ws);
     let mut f = std::fs::OpenOptions::new()
@@ -263,7 +253,9 @@ fn write_loopback_in(ws: &std::path::Path, text: &str) -> anyhow::Result<()> {
 }
 
 /// Called when an out message with a swarm header is observed on a workspace.
-pub fn on_reply(
+/// Fire-and-forget: mark done, append the ledger row, recycle the terminal.
+/// No callback forwarding, no parent bookkeeping, no supervisor notify.
+pub fn on_out(
     sched: &Arc<Sched>,
     from_ws: &str,
     msg: &crate::proto::SwarmMessage,
@@ -272,118 +264,75 @@ pub fn on_reply(
     let Some(task) = sched.db.get(task_id)? else {
         return Ok(()); // Unknown task: ignore.
     };
-    // Idempotent redelivery: an already-terminal task (Replied/Failed/
-    // Cancelled/Closed) never re-forwards nor double-decrements the parent.
+    // Idempotent redelivery: an already-terminal task never re-records.
     match task.state {
-        crate::db::TaskState::Replied
+        crate::db::TaskState::Done
         | crate::db::TaskState::Failed
         | crate::db::TaskState::Cancelled
         | crate::db::TaskState::Closed => return Ok(()),
         _ => {}
     }
-    sched.db
-        .set_state(task_id, crate::db::TaskState::Replied)?;
-    sched.emit(
-        "task_replied",
-        serde_json::json!({"task_id": task_id, "from": from_ws, "reply_to": task.reply_to}),
+    sched.db.set_state(task_id, crate::db::TaskState::Done)?;
+    let out_head: String = msg.payload.chars().take(200).collect();
+    sched.db.set_ledger(task_id, "done", &out_head, "")?;
+    crate::db::append_ledger_line(
+        &sched.root,
+        &crate::db::LedgerEvent {
+            task_id: task_id.clone(),
+            transfer_send_to: task.transfer_send_to.clone(),
+            from_ws: from_ws.into(),
+            to_ws: task.to_ws.clone(),
+            state: "done".into(),
+            out_head,
+            reason: String::new(),
+        },
     );
-    // Forward the callback to the parent (if any): write into the parent's
-    // workspace in as a new message carrying the same family headers.
-    if !task.reply_to.is_empty() {
-        if let Some(parent) = sched.db.get(&task.reply_to)? {
-            let fwd = crate::proto::SwarmHeader {
-                task_id: task.task_id.clone(),
-                from: from_ws.into(),
-                reply_to: parent.task_id.clone(),
-                attempt: task.attempt,
-            };
-            let parent_ws = crate::root::resolve_instance(&sched.root, &parent.to_ws);
-            let wire = crate::proto::render(&fwd, "", &msg.payload);
-            write_loopback_in(&parent_ws, &wire)?;
-            sched.emit(
-                "callback_forwarded",
-                serde_json::json!({"task_id": task_id, "to_parent": parent.task_id}),
-            );
-            if let Some(updated) = sched.db.dec_parent(&parent.task_id)? {
-                if updated.pending_replies <= 0 {
-                    maybe_close(sched, &parent.task_id)?;
-                }
-            }
-        } else {
-            sched.db.dead_letter(task_id, "parent task missing")?;
-        }
-    } else if !task.from_ws.is_empty() && task.from_ws != "." {
-        // Top-level task from a supervisor workspace: notify the `from` workspace.
-        let sup_ws = crate::root::resolve_instance(&sched.root, &task.from_ws);
-        if sup_ws.is_dir() {
-            let fwd = crate::proto::SwarmHeader {
-                task_id: task.task_id.clone(),
-                from: from_ws.into(),
-                reply_to: String::new(),
-                attempt: task.attempt,
-            };
-            write_loopback_in(&sup_ws, &crate::proto::render(&fwd, "", &msg.payload))?;
-            sched.emit(
-                "callback_forwarded",
-                serde_json::json!({"task_id": task_id, "to_parent": task.from_ws}),
-            );
-        }
-    }
-    maybe_close(sched, task_id)?;
+    sched.emit(
+        "task_done",
+        serde_json::json!({"task_id": task_id, "from": from_ws}),
+    );
+    close_terminal(sched, task_id)?;
+    sched.db.set_state(task_id, crate::db::TaskState::Closed)?;
+    sched.emit("task_closed", serde_json::json!({"task_id": task_id}));
     Ok(())
 }
 
 /// Called when a session exits without writing out (early exit = failure).
-/// Writes the failure callback to the initiator and recycles the terminal.
-/// The task itself is NOT replayed; retry belongs to external pi plugins.
+/// Records failed + ledger, recycles the terminal. No callback is written
+/// anywhere (amendment-1: fire-and-forget). The task is NOT replayed.
 pub fn on_early_exit(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::Result<()> {
     let Some(task) = sched.db.get(task_id)? else {
         return Ok(());
     };
-    if task.state == crate::db::TaskState::Replied
+    if task.state == crate::db::TaskState::Done
         || task.state == crate::db::TaskState::Closed
     {
         return Ok(());
     }
-    sched.db
-        .set_state(task_id, crate::db::TaskState::Failed)?;
+    sched.db.set_state(task_id, crate::db::TaskState::Failed)?;
+    sched.db.set_ledger(task_id, "failed", "", reason)?;
+    crate::db::append_ledger_line(
+        &sched.root,
+        &crate::db::LedgerEvent {
+            task_id: task_id.into(),
+            transfer_send_to: task.transfer_send_to.clone(),
+            from_ws: task.from_ws.clone(),
+            to_ws: task.to_ws.clone(),
+            state: "failed".into(),
+            out_head: String::new(),
+            reason: crate::proto::failed_reason(reason),
+        },
+    );
     sched.emit(
         "task_failed",
         serde_json::json!({"task_id": task_id, "to": task.to_ws, "reason": reason}),
     );
-    let body = crate::proto::failed_payload(reason, "");
-    if !task.reply_to.is_empty() {
-        if let Some(parent) = sched.db.get(&task.reply_to)? {
-            let fwd = crate::proto::SwarmHeader {
-                task_id: task_id.into(),
-                from: task.to_ws.clone(),
-                reply_to: parent.task_id.clone(),
-                attempt: task.attempt,
-            };
-            let parent_ws = crate::root::resolve_instance(&sched.root, &parent.to_ws);
-            if parent_ws.is_dir() {
-                write_loopback_in(&parent_ws, &crate::proto::render(&fwd, "", &body))?;
-                sched.emit(
-                    "callback_forwarded",
-                    serde_json::json!({"task_id": task_id, "to_parent": parent.task_id}),
-                );
-                if let Some(updated) = sched.db.dec_parent(&parent.task_id)? {
-                    if updated.pending_replies <= 0 {
-                        maybe_close(sched, &parent.task_id)?;
-                    }
-                }
-            } else {
-                sched.db.dead_letter(task_id, "parent workspace missing")?;
-            }
-        } else {
-            sched.db.dead_letter(task_id, "parent task missing")?;
-        }
-    }
     close_terminal(sched, task_id)?;
     Ok(())
 }
 
-/// Cancel a task family: kill terminals, mark cancelled, notify initiator.
+/// Cancel a task family: kill terminals, mark cancelled, append ledger rows.
+/// Lineage follows transfer_send_to downstream (spawns), not upstream waits.
 pub fn cancel(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::Result<Vec<String>> {
     let fam = sched.db.family(task_id)?;
     let mut out = vec![];
@@ -393,9 +342,20 @@ pub fn cancel(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::Result
         {
             continue;
         }
-        sched
-            .db
-            .set_state(&t.task_id, crate::db::TaskState::Cancelled)?;
+        sched.db.set_state(&t.task_id, crate::db::TaskState::Cancelled)?;
+        sched.db.set_ledger(&t.task_id, "cancelled", "", reason)?;
+        crate::db::append_ledger_line(
+            &sched.root,
+            &crate::db::LedgerEvent {
+                task_id: t.task_id.clone(),
+                transfer_send_to: t.transfer_send_to.clone(),
+                from_ws: t.from_ws.clone(),
+                to_ws: t.to_ws.clone(),
+                state: "cancelled".into(),
+                out_head: String::new(),
+                reason: crate::proto::cancelled_reason(reason),
+            },
+        );
         close_terminal(sched, &t.task_id)?;
         out.push(t.task_id.clone());
         sched.emit(
@@ -403,39 +363,7 @@ pub fn cancel(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::Result
             serde_json::json!({"task_id": t.task_id, "reason": "cancelled"}),
         );
     }
-    if let Some(root_task) = sched.db.get(task_id)? {
-        if !root_task.reply_to.is_empty() {
-            if let Some(parent) = sched.db.get(&root_task.reply_to)? {
-                let body = crate::proto::cancelled_payload(reason, "");
-                let fwd = crate::proto::SwarmHeader {
-                    task_id: task_id.into(),
-                    from: root_task.to_ws.clone(),
-                    reply_to: parent.task_id.clone(),
-                    attempt: root_task.attempt,
-                };
-                let parent_ws = crate::root::resolve_instance(&sched.root, &parent.to_ws);
-                if parent_ws.is_dir() {
-                    write_loopback_in(&parent_ws, &crate::proto::render(&fwd, "", &body))?;
-                }
-                sched.db.dec_parent(&parent.task_id)?;
-            }
-        }
-    }
     Ok(out)
-}
-
-/// Close when: own out written (replied) AND no pending child replies.
-pub fn maybe_close(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
-    let Some(t) = sched.db.get(task_id)? else {
-        return Ok(());
-    };
-    if t.state == crate::db::TaskState::Replied && t.pending_replies <= 0 {
-        close_terminal(sched, task_id)?;
-        sched.db
-            .set_state(task_id, crate::db::TaskState::Closed)?;
-        sched.emit("task_closed", serde_json::json!({"task_id": task_id}));
-    }
-    Ok(())
 }
 
 fn close_terminal(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
@@ -470,130 +398,92 @@ mod sched_tests {
         Sched::new(root.to_path_buf(), db)
     }
 
-    fn hdr(task_id: &str, reply_to: &str) -> crate::proto::SwarmHeader {
+    fn hdr(task_id: &str, transfer: &str) -> crate::proto::SwarmHeader {
         crate::proto::SwarmHeader {
             task_id: task_id.into(),
             from: ".".into(),
-            reply_to: reply_to.into(),
+            transfer_send_to: transfer.into(),
             attempt: 1,
         }
     }
 
-    fn reply_msg(task_id: &str, reply_to: &str, payload: &str) -> crate::proto::SwarmMessage {
+    fn reply_msg(task_id: &str, transfer: &str, payload: &str) -> crate::proto::SwarmMessage {
         crate::proto::SwarmMessage {
-            header: hdr(task_id, reply_to),
+            header: hdr(task_id, transfer),
             payload: payload.into(),
         }
     }
 
     /// Insert a task row directly (bypasses orca terminal creation).
-    fn seed(sched: &Arc<Sched>, task_id: &str, to: &str, reply_to: &str, state: TaskState) {
+    fn seed(sched: &Arc<Sched>, task_id: &str, to: &str, transfer: &str, state: TaskState) {
         sched
             .db
-            .insert_task(task_id, ".", to, reply_to, 1, "payload")
+            .insert_task(task_id, ".", to, transfer, 1, "payload")
             .unwrap();
         sched.db.set_state(task_id, state).unwrap();
     }
 
     #[test]
-    fn reply_without_parent_closes_task() {
+    fn out_without_parent_marks_done_and_closes() {
         let s = test_sched();
         seed(&s, "t1", "a", "", TaskState::Running);
-        on_reply(&s, "a", &reply_msg("t1", "", "done")).unwrap();
+        on_out(&s, "a", &reply_msg("t1", "", "done")).unwrap();
         let t = s.db.get("t1").unwrap().unwrap();
         assert_eq!(t.state, TaskState::Closed);
+        let tail = s.db.ledger(10).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].state, "done");
     }
 
     #[test]
-    fn reply_forwards_callback_and_decrements_parent() {
+    fn out_is_fire_and_forget_no_parent_write() {
         let s = test_sched();
-        // Parent workspace dir must exist for the FIFO write; create a fake
-        // instance dir with a real fifo? write_loopback_in opens the fifo, so
-        // instead point parent at "." (root) -- still needs a fifo. Use a
-        // real FIFO via mkfifo through std::process? Simpler: create the
-        // parent in workspace "a" and pre-create root loopback fifo.
         seed(&s, "parent", "a", "", TaskState::Running);
-        s.db.bump_parent("parent", 1).unwrap();
         seed(&s, "child", "b", "parent", TaskState::Running);
-        // Pre-create the parent workspace loopback fifo so the forward lands.
-        let ws_a = crate::root::resolve_instance(&s.root, "a");
-        std::fs::create_dir_all(ws_a.join(".onlyne/channels/loopback")).unwrap();
-        let fifo = crate::root::loopback_in(&ws_a);
-        // SAFETY: test-only; create fifo via libc mknod through std.
-        #[cfg(unix)]
-        {
-            let _ = std::fs::remove_file(&fifo);
-            // Use mkfifo(1); guaranteed on macOS/dev machines.
-            let st = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
-            assert!(st.success());
-            // Hold a reader so the scheduler's O_WRONLY open never blocks.
-            let fifo2 = fifo.clone();
-            std::thread::spawn(move || {
-                use std::io::Read;
-                loop {
-                    if let Ok(mut f) = std::fs::File::open(&fifo2) {
-                        let mut buf = Vec::new();
-                        let _ = f.read_to_end(&mut buf);
-                    } else {
-                        break;
-                    }
-                }
-            });
-        }
-        on_reply(&s, "b", &reply_msg("child", "parent", "child done")).unwrap();
+        on_out(&s, "b", &reply_msg("child", "parent", "child done")).unwrap();
         let child = s.db.get("child").unwrap().unwrap();
         assert_eq!(child.state, TaskState::Closed);
+        // Parent untouched: no callback, no counter, no close.
         let parent = s.db.get("parent").unwrap().unwrap();
-        assert_eq!(parent.pending_replies, 0);
+        assert_eq!(parent.state, TaskState::Running);
     }
 
     #[test]
-    fn duplicate_reply_is_idempotent() {
+    fn duplicate_out_is_idempotent() {
         let s = test_sched();
-        seed(&s, "p", "a", "", TaskState::Running);
-        s.db.bump_parent("p", 1).unwrap();
+        seed(&s, "c", "b", "", TaskState::Running);
+        let msg = reply_msg("c", "", "x");
+        on_out(&s, "b", &msg).unwrap();
+        on_out(&s, "b", &msg).unwrap();
+        let tail = s.db.ledger(10).unwrap();
+        assert_eq!(tail.len(), 1);
+    }
+
+    #[test]
+    fn unknown_out_is_ignored() {
+        let s = test_sched();
+        on_out(&s, "a", &reply_msg("ghost", "", "x")).unwrap();
+    }
+
+    #[test]
+    fn early_exit_records_failed_without_callback() {
+        let s = test_sched();
         seed(&s, "c", "b", "p", TaskState::Running);
-        let ws_a = crate::root::resolve_instance(&s.root, "a");
-        std::fs::create_dir_all(ws_a.join(".onlyne/channels/loopback")).unwrap();
-        // No fifo: forward would fail. Instead use parent == child ws trick?
-        // Simpler: point parent workspace at a dir WITH a drained fifo.
-        let fifo = crate::root::loopback_in(&ws_a);
-        let _ = std::fs::remove_file(&fifo);
-        let st = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
-        assert!(st.success());
-        let fifo2 = fifo.clone();
-        std::thread::spawn(move || {
-            use std::io::Read;
-            loop {
-                if let Ok(mut f) = std::fs::File::open(&fifo2) {
-                    let mut buf = Vec::new();
-                    let _ = f.read_to_end(&mut buf);
-                } else {
-                    break;
-                }
-            }
-        });
-        let msg = reply_msg("c", "p", "x");
-        on_reply(&s, "b", &msg).unwrap();
-        // Second identical delivery must be a no-op (no double decrement).
-        on_reply(&s, "b", &msg).unwrap();
-        let parent = s.db.get("p").unwrap().unwrap();
-        assert_eq!(parent.pending_replies, 0);
-    }
-
-    #[test]
-    fn unknown_reply_is_ignored() {
-        let s = test_sched();
-        on_reply(&s, "a", &reply_msg("ghost", "", "x")).unwrap();
+        seed(&s, "p", "a", "", TaskState::Running);
+        on_early_exit(&s, "c", "boom").unwrap();
+        assert_eq!(s.db.get("c").unwrap().unwrap().state, TaskState::Failed);
+        assert_eq!(s.db.get("p").unwrap().unwrap().state, TaskState::Running);
+        let tail = s.db.ledger(10).unwrap();
+        assert!(tail.iter().any(|e| e.task_id == "c" && e.state == "failed"));
     }
 
     #[test]
     fn render_snapshot_shapes() {
         let tasks = vec![
             serde_json::json!({"task_id": "abcdefgh-1234", "from_ws": ".", "to_ws": "a",
-                               "attempt": 1, "state": "running", "pending_replies": 2}),
+                               "attempt": 1, "state": "running", "transfer_send_to": ""}),
             serde_json::json!({"task_id": "x", "from_ws": "a", "to_ws": "b",
-                               "attempt": 3, "state": "failed", "pending_replies": 0}),
+                               "attempt": 3, "state": "failed", "transfer_send_to": "p"}),
         ];
         let snap = crate::tui::snapshot_for_test(
             serde_json::Value::Null,
