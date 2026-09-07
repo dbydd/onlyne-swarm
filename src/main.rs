@@ -1,6 +1,7 @@
 mod daemon;
 mod db;
 mod events;
+mod hierarchy;
 mod init;
 mod ipc;
 mod orca;

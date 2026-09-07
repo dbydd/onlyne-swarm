@@ -90,8 +90,12 @@ attempt: <整数，首次为 1>
   调度器结束 pi 进程，orca 自动回收 terminal。不维护常驻 idle 池（空闲是瞬态），
   允许实现一个按 workspace 路径分组的瞬态 ready 池应对突发并发，超期无任务认领即回收。
 - 可见性：terminal 默认建在后台（`create` 不带 `--focus`，`SWARM_FOCUS=all|new`
-  可选 opt-in；fan-out 下默认抢焦点不可用）。投递成功后调度器用 `terminal rename`
-  把 tab 标题钉回 `swarm:<to>:<id8>`（pi 启动时会覆写 create-time 标题）。
+  可选 opt-in；fan-out 下默认抢焦点不可用）。标题由 session 侧钉选（claim 时 +
+  每次 idle，`43d7a80`，谁最后写谁赢）。层级映射经 V1–V5 手测证伪：
+  Orca CLI 无法把已存在的 `.ws/<name>` 目录挂成根 worktree 的子节点
+  （folder-kind/repo-add 实体不可寻址、跨 repo 挂父被拒、`worktree create`
+  恒建新 checkout），hop tab 保持根下 `swarm:*` 平铺；`sync` 逐 workspace
+  探测并报告，不中断。见 `src/hierarchy.rs`。
 - 投递时序：`orca terminal create` 起 pi 有启动延迟。pi-onlyne swarm 模式启动后向本地 daemon
   发送新增的 `swarm_ready` 操作（载荷：workspace 路径 + 自报 terminal 句柄 + 时间戳，
   句柄只做 TUI 展示与 kill 用）。调度器经事件订阅收集 ready 信号，按 workspace 路径匹配

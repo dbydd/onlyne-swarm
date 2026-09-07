@@ -47,6 +47,10 @@ pub struct SyncReport {
     pub orphans: Vec<String>,
     pub dangling: Vec<String>,
     pub workspaces: usize,
+    /// Orca hierarchy notes, one per workspace where registration was
+    /// attempted (V1–V5 verified-negative: existing dirs cannot attach).
+    #[serde(default)]
+    pub hierarchy: Vec<String>,
 }
 
 /// Generate `.ws` from `.agents/.schedule`.
@@ -104,7 +108,32 @@ pub fn run_sync(root: &Path) -> anyhow::Result<SyncReport> {
     }
 
     refresh_links(root, &tree, &mut report)?;
+    register_hierarchy(root, &tree, &mut report);
     Ok(report)
+}
+
+/// Best-effort Orca hierarchy probe per workspace (SPEC amendment 2,
+/// verified V1–V5 negative). Never fails sync; records the outcome.
+fn register_hierarchy(root: &Path, tree: &[Effective], report: &mut SyncReport) {
+    use crate::hierarchy::HierarchyOutcome;
+    for e in tree {
+        if e.path.is_empty() {
+            continue; // root is already an Orca worktree; nothing to attach
+        }
+        let ws = crate::root::resolve_instance(root, &e.path);
+        match crate::hierarchy::ensure_child(root, &ws) {
+            HierarchyOutcome::Attached { worktree_id } => report.hierarchy.push(format!(
+                "{}: attached as {}",
+                display_path(&e.path),
+                worktree_id
+            )),
+            HierarchyOutcome::Unsupported => report.hierarchy.push(format!(
+                "{}: flat tab (Orca CLI cannot attach existing dirs as child worktrees)",
+                display_path(&e.path)
+            )),
+            HierarchyOutcome::Skipped => {}
+        }
+    }
 }
 
 fn display_path(p: &str) -> String {
