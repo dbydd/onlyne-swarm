@@ -406,7 +406,8 @@ fn close_terminal(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
         // Best effort: kill pi, then close the orca terminal tab.
         // kill first (reclaims the pi process); close drops the tab even if
         // the process already exited, so no orphan tabs accumulate in Orca.
-        let _ = crate::orca_term::kill_pi(&h);
+        // Scoped to this hop's task id: never a global pgrep sweep.
+        let _ = crate::orca_term::kill_pi_for_task(&h, task_id);
         let _ = crate::orca_term::close(&h);
     }
     Ok(())

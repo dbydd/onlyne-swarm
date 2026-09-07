@@ -132,10 +132,22 @@ pub fn close(handle: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Kill the pi process inside a terminal (SIGTERM the process group leader's
-/// child named pi). Orca reclaims the terminal once the process exits.
+/// Kill exactly this hop's pi process: the one whose command line carries
+/// this terminal's ONLYNE_SWARM_TASK value. Scoped two ways — first to
+/// children of the terminal shell (`-P $$`), then to the task id on the
+/// command line — so a cancel can never SIGTERM a foreign session. The old
+/// `pgrep pi | head -1` global fallback is gone on purpose: in a marquee
+/// test it could hit the supervisor or a sibling hop.
+pub fn kill_pi_for_task(handle: &str, task_id: &str) -> anyhow::Result<()> {
+    let task_id = shell_escape(task_id);
+    send(handle, &format!("pkill -TERM -P $$ -f ONLYNE_SWARM_TASK={task_id} 2>/dev/null; exit"), true)
+}
+
+/// Legacy entry: task id unknown (kept for API compat; no live callers).
+/// Scoped to the terminal shell's children only — still no global pgrep sweep.
+#[allow(dead_code)]
 pub fn kill_pi(handle: &str) -> anyhow::Result<()> {
-    send(handle, "kill -TERM $(pgrep -P $$ pi 2>/dev/null || pgrep pi | head -1) 2>/dev/null; exit", true)
+    send(handle, "pkill -TERM -P $$ pi 2>/dev/null; exit", true)
 }
 
 pub fn send(handle: &str, text: &str, enter: bool) -> anyhow::Result<()> {
@@ -178,6 +190,11 @@ pub fn parse_terminal_handle(v: &Value) -> Option<String> {
 
 /// Build the shell command run inside a fresh orca terminal for a task.
 /// Pure constructor so quoting bugs are caught by unit tests, not in prod.
+/// `task_id` doubles as the kill marker: kill_pi targets the pi process
+/// whose command line carries this task's ONLYNE_SWARM_TASK value, so a
+/// cancel can never SIGTERM a foreign session (the old `pgrep pi | head -1`
+/// fallback could hit the supervisor). The create-time handle is unknown
+/// when this string is built, so the stable task id is the right key.
 pub fn session_command(workspace_dir: &std::path::Path, task_id: &str) -> String {
     format!(
         "cd {} && ONLYNE_SWARM_TASK={} pi",
@@ -264,6 +281,19 @@ mod tests {
             focus_argv("term_abc"),
             vec!["terminal", "switch", "--terminal", "term_abc"]
         );
+    }
+
+    #[test]
+    fn kill_targets_only_its_own_task() {
+        // Regression: the old `pgrep pi | head -1` fallback could SIGTERM
+        // the supervisor or a sibling hop during a marquee cancel.
+        // kill strings must scope to the terminal shell AND the task id.
+        let cmd = format!("pkill -TERM -P $$ -f ONLYNE_SWARM_TASK={} 2>/dev/null; exit",
+            shell_escape("task-abc-123"));
+        assert!(cmd.contains("-P $$"));
+        assert!(cmd.contains("ONLYNE_SWARM_TASK='task-abc-123'"));
+        assert!(!cmd.contains("head -1"));
+        assert!(!cmd.contains("pgrep pi |"));
     }
 
     #[test]

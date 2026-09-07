@@ -118,7 +118,9 @@ fn list_setup_for(dir: &std::path::Path) -> Option<String> {
 
 /// Derive the Orca project id for the swarm root from its git origin.
 /// Falls back to None (caller substitutes a default); never fails.
-/// Kept for future use; registration is currently disabled.
+/// Currently unused (registration disabled); kept with its test so a
+/// future Orca release with folder-child support plugs back in.
+#[allow(dead_code)]
 pub fn root_project(root: &std::path::Path) -> Option<String> {
     let out = Command::new("git")
         .args(["-C"])
