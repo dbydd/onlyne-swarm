@@ -1,21 +1,22 @@
-use anyhow::Context;
-use serde_json::Value;
 use std::process::Command;
 
-/// Orca hierarchy registration (SPEC amendment 2, verified V1–V5).
+/// Orca hierarchy registration: one folder-kind node per workspace dir.
 ///
-/// Hand-verified facts (do NOT re-derive from `terminal create --help`):
-/// - `project setup-existing-folder --kind folder` registers the dir but the
-///   entity is NOT addressable via `worktree show --worktree path:` and gets a
-///   FRESH repoId, so `worktree set --parent-worktree` fails with
-///   LINEAGE_PARENT_CONTEXT_CONFLICT (parent must share repository).
-/// - `repo add --path` also yields selector_not_found on `worktree show`.
+/// Hand-verified facts (live CLI probes, see commit history):
+/// - `project setup-existing-folder --kind folder` registers the dir as an
+///   addressable worktree (`worktree show --worktree path:<canon-dir>` resolves
+///   it; Orca canonicalizes symlinked prefixes, so callers must pass the
+///   canonical path — an uncanonicalized /tmp/... selector_not_founds while
+///   /private/tmp/... resolves).
+/// - `terminal create --worktree path:<node-dir>` lands the tab under that
+///   node; same-workspace concurrent hops are sibling tabs (verified: 2 tabs
+///   under one node). Selector must also be canonicalized.
+/// - `worktree set --parent-worktree` across repos is refused
+///   (LINEAGE_PARENT_CONTEXT_CONFLICT), so nodes stay same-level siblings —
+///   no parent/child chain. That is fine: visibility comes from node + tab
+///   placement, not lineage.
 /// - `worktree create` always makes a NEW checkout elsewhere — never usable
 ///   for pointing at an existing `.ws/<name>` dir.
-/// Conclusion: Orca CLI offers no way to attach an existing directory as a
-/// child worktree of the swarm root. Hop terminals stay under the root
-/// worktree as `swarm:*` tabs (205288e behavior). This module only probes
-/// reachability so sync can log why hierarchy was skipped.
 
 fn orca() -> Command {
     let bin = std::env::var("ORCA_CLI_COMMAND").unwrap_or_else(|_| "orca".into());
@@ -57,17 +58,7 @@ pub fn show_worktree_id(dir: &std::path::Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Attempt hierarchy registration for one workspace dir. Currently always
-/// reports the verified-negative outcome; kept as a function so a future
-/// Orca release with folder-child support plugs in here.
-pub enum HierarchyOutcome {
-    /// Already (or now) an addressable worktree under the swarm root.
-    Attached { worktree_id: String },
-    /// No CLI path attaches an existing dir as a child worktree (V1–V5).
-    Unsupported,
-    /// Orca unreachable; caller logs and continues.
-    Skipped,
-}
+/// Outcome of ensuring one workspace node exists.
 
 /// Display name for a workspace node: `swarm:<tree-path>`, root is `swarm:.`.
 pub fn node_display_name(tree_path: &str) -> String {
@@ -114,22 +105,28 @@ pub fn ensure_node(
         .ok_or_else(|| anyhow::anyhow!("registered {} but not addressable", dir.display()))
 }
 
-pub fn ensure_child(_root: &std::path::Path, dir: &std::path::Path) -> HierarchyOutcome {
-    ensure_child_project(None, dir)
+/// Outcome of ensuring one workspace node exists.
+pub enum HierarchyOutcome {
+    /// Node registered (or already present), addressable by path.
+    Attached { worktree_id: String },
+    /// Registration failed; hop tabs fall back to the root worktree.
+    Unsupported,
+    /// Orca unreachable; caller logs and continues.
+    Skipped,
 }
 
-/// ensure_child with an explicit project override (sync passes the root's
-/// project so sibling nodes share it instead of re-deriving per node).
-pub fn ensure_child_project(project: Option<&str>, dir: &std::path::Path) -> HierarchyOutcome {
+/// Ensure the folder-kind node for one workspace dir exists, with the given
+/// display name. Best effort: any failure maps to Unsupported so sync never
+/// breaks; the hop still runs, its tab just lands under the root worktree.
+pub fn ensure_child(project: Option<&str>, dir: &std::path::Path, display_name: &str) -> HierarchyOutcome {
     if !reachable() {
         return HierarchyOutcome::Skipped;
     }
-    if let Some(id) = show_worktree_id(dir) {
-        return HierarchyOutcome::Attached { worktree_id: id };
+    let project = project.unwrap_or("github:dbydd/onlyne");
+    match ensure_node(project, dir, display_name) {
+        Ok(worktree_id) => HierarchyOutcome::Attached { worktree_id },
+        Err(_) => HierarchyOutcome::Unsupported,
     }
-    // Best effort only; failure keeps flat-tab behavior (see register_hierarchy).
-    let _ = project;
-    HierarchyOutcome::Unsupported
 }
 
 /// Derive the Orca project id for the swarm root from its git origin.

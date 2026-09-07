@@ -47,8 +47,7 @@ pub struct SyncReport {
     pub orphans: Vec<String>,
     pub dangling: Vec<String>,
     pub workspaces: usize,
-    /// Orca hierarchy notes, one per workspace where registration was
-    /// attempted (V1–V5 verified-negative: existing dirs cannot attach).
+    /// Orca hierarchy notes, one per non-root workspace.
     #[serde(default)]
     pub hierarchy: Vec<String>,
 }
@@ -112,11 +111,10 @@ pub fn run_sync(root: &Path) -> anyhow::Result<SyncReport> {
     Ok(report)
 }
 
-/// Best-effort Orca hierarchy probe per workspace (SPEC amendment 2,
-/// verified V1–V5 negative). Never fails sync; records the outcome.
-/// Node registration is best-effort per workspace: reachable Orca gets a
-/// folder-kind node per dir (`swarm:<tree-path>` display name); failures
-/// keep flat-tab behavior and are recorded, never fatal.
+/// Best-effort Orca node registration per workspace. Never fails sync;
+/// records the outcome. Each `.ws/<name>` becomes a folder-kind node
+/// (`swarm:<tree-path>` display name) so hop terminals land as tabs under
+/// their own workspace node instead of piling up under the root worktree.
 fn register_hierarchy(root: &Path, tree: &[Effective], report: &mut SyncReport) {
     use crate::hierarchy::HierarchyOutcome;
     let project = crate::hierarchy::root_project(root);
@@ -125,31 +123,15 @@ fn register_hierarchy(root: &Path, tree: &[Effective], report: &mut SyncReport) 
             continue; // root is already an Orca worktree; nothing to attach
         }
         let ws = crate::root::resolve_instance(root, &e.path);
-        // Register the folder-kind node first; ensure_child then probes it.
-        if crate::hierarchy::reachable() {
-            let name = crate::hierarchy::node_display_name(&e.path);
-            match crate::hierarchy::ensure_node(
-                project.as_deref().unwrap_or("github:dbydd/onlyne"),
-                &ws,
-                &name,
-            ) {
-                Ok(id) => {
-                    report.hierarchy.push(format!("{}: node {}", display_path(&e.path), id));
-                    continue;
-                }
-                Err(err) => {
-                    report.hierarchy.push(format!("{}: node skipped ({err})", display_path(&e.path)));
-                }
-            }
-        }
-        match crate::hierarchy::ensure_child(root, &ws) {
+        let name = crate::hierarchy::node_display_name(&e.path);
+        match crate::hierarchy::ensure_child(project.as_deref(), &ws, &name) {
             HierarchyOutcome::Attached { worktree_id } => report.hierarchy.push(format!(
-                "{}: attached as {}",
+                "{}: node {}",
                 display_path(&e.path),
                 worktree_id
             )),
             HierarchyOutcome::Unsupported => report.hierarchy.push(format!(
-                "{}: flat tab (Orca CLI cannot attach existing dirs as child worktrees)",
+                "{}: node skipped (Orca registration failed; tabs fall back to root worktree)",
                 display_path(&e.path)
             )),
             HierarchyOutcome::Skipped => {}
