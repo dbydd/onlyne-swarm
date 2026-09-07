@@ -34,13 +34,54 @@ fn run_json(mut cmd: Command) -> anyhow::Result<Value> {
 /// is created. Instead a fake handle is returned and the test harness is
 /// expected to drive `swarm_ready` + task reply itself (see TEST.md).
 pub fn create(title: &str, cwd: &std::path::Path, env_task: &str) -> anyhow::Result<Terminal> {
+    create_with_opts(title, cwd, env_task, &CreateOpts::default())
+}
+
+/// Options for terminal creation. Focus defaults to off: a scheduler that
+/// steals window focus on every hop would be unusable during fan-out.
+/// Operators opt in per tree via SWARM_FOCUS=new|all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateOpts {
+    pub focus: bool,
+}
+
+impl Default for CreateOpts {
+    fn default() -> Self {
+        let mode = std::env::var("SWARM_FOCUS").unwrap_or_default();
+        Self {
+            focus: mode == "all" || mode == "new",
+        }
+    }
+}
+
+/// Pure argv constructor so focus/worktree wiring is unit-tested.
+pub fn create_argv(title: &str, focus: bool) -> Vec<String> {
+    let mut argv = vec![
+        "terminal".to_string(),
+        "create".to_string(),
+        "--title".to_string(),
+        title.to_string(),
+    ];
+    if focus {
+        argv.push("--focus".to_string());
+    }
+    argv.push("--command".to_string());
+    argv
+}
+
+pub fn create_with_opts(
+    title: &str,
+    cwd: &std::path::Path,
+    env_task: &str,
+    opts: &CreateOpts,
+) -> anyhow::Result<Terminal> {
     if std::env::var("SWARM_STUB_AGENT").as_deref() == Ok("1") {
         return Ok(Terminal {
             handle: format!("stub-{title}-{env_task}"),
         });
     }
     let mut cmd = orca();
-    cmd.args(["terminal", "create", "--title", title, "--command"]);
+    cmd.args(create_argv(title, opts.focus));
     // Keep normal extension discovery enabled so retry and other configured
     // extensions are available in real swarm sessions.
     cmd.arg(session_command(cwd, env_task));
@@ -50,6 +91,15 @@ pub fn create(title: &str, cwd: &std::path::Path, env_task: &str) -> anyhow::Res
         anyhow::bail!("orca terminal create returned no handle: {v}");
     }
     Ok(Terminal { handle })
+}
+
+/// Rename a terminal tab. Best effort: re-assert the swarm title after the
+/// session starts, since pi overwrites the create-time title on boot.
+pub fn rename(handle: &str, title: &str) -> anyhow::Result<()> {
+    let mut cmd = orca();
+    cmd.args(["terminal", "rename", "--terminal", handle, "--title", title]);
+    run_json(cmd)?;
+    Ok(())
 }
 
 pub fn close(handle: &str) -> anyhow::Result<()> {
@@ -166,6 +216,20 @@ mod tests {
         // Single quotes in paths are escaped, never break the shell string.
         let cmd = session_command(std::path::Path::new("/o'b"), "t");
         assert!(cmd.contains("'/o'\\''b'"), "{cmd}");
+    }
+
+    #[test]
+    fn create_argv_focus_is_opt_in() {
+        // Default: background tab, no focus steal during fan-out.
+        assert_eq!(
+            create_argv("swarm:a:12345678", false),
+            vec!["terminal", "create", "--title", "swarm:a:12345678", "--command"]
+        );
+        assert_eq!(
+            create_argv("swarm:a:12345678", true).last().map(String::as_str),
+            Some("--command")
+        );
+        assert!(create_argv("t", true).contains(&"--focus".to_string()));
     }
 
     #[test]

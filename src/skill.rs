@@ -116,6 +116,15 @@ streams, and serves `.onlyne/run/swarm.sock`. Each dispatch opens one Orca
 terminal with `pi`. The session sends `swarm_ready`, receives the persisted
 payload through follow-up, and completes through the plugin reply tools.
 
+## Visibility in Orca
+
+Hop terminals live under the swarm root's single Orca worktree as background
+tabs titled `swarm:<to>:<id8>` (re-asserted on delivery; pi overwrites the
+create-time title on boot). They do not appear as separate worktrees and
+nested directories do not register folder contexts — that mapping is
+explicitly out of scope. Set `SWARM_FOCUS=all` (or `new`) in the scheduler
+environment to reveal each created terminal; leave it unset during fan-out.
+
 ## Monitor and cancel
 
 ```bash

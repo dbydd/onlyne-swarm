@@ -176,6 +176,12 @@ pub fn on_ready(
                 .insert(task_id.clone(), terminal_handle.into());
             sched.awaiting_ready.lock().unwrap().remove(&task_id);
             deliver_to_terminal(sched, &task_id, workspace, terminal_handle)?;
+            // Re-assert the swarm title: pi overwrites the create-time title
+            // on boot, so without this the tab shows a generic pi title.
+            // Best effort; a failed rename must not fail the delivery.
+            let title =
+                format!("swarm:{}:{}", workspace, &task_id[..8.min(task_id.len())]);
+            let _ = crate::orca_term::rename(terminal_handle, &title);
             Ok(())
         }
         None => {
