@@ -150,26 +150,23 @@ fn dispatch(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::Result<()> {
 /// Called when `swarm_ready{workspace, terminal_handle}` arrives from a daemon
 /// subscription. Matches a pending task on the same workspace path (fork+exec:
 /// any clean ready terminal on that path may take the task).
+///
+/// Matching order matters (a live session was once killed by timeout while
+/// working): prefer the task whose created terminal handle equals the reported
+/// handle — dispatch records it at create time and orca exposes the same value
+/// as ORCA_TERMINAL_HANDLE inside the terminal. Only fall back to path-based
+/// matching for handles we never created (manual sessions, empty env).
 pub fn on_ready(
     sched: &Arc<Sched>,
     workspace: &str,
     terminal_handle: &str,
 ) -> anyhow::Result<()> {
-    // Find oldest pending/awaiting task for this workspace path.
-    let candidate: Option<String> = {
-        let awaiting = sched.awaiting_ready.lock().unwrap();
-        let rows = sched.db.list(None, 200)?;
-        rows.into_iter()
-            .filter(|r| {
-                (r.state == crate::db::TaskState::Pending
-                    || r.state == crate::db::TaskState::Running)
-                    && r.to_ws == workspace
-                    && (awaiting.contains_key(&r.task_id)
-                        || sched.terminals.lock().unwrap().contains_key(&r.task_id))
-            })
-            .map(|r| r.task_id)
-            .next()
-    };
+    let rows = sched.db.list(None, 200)?;
+    let awaiting = sched.awaiting_ready.lock().unwrap();
+    let terminals = sched.terminals.lock().unwrap();
+    let candidate = match_candidate(&rows, &awaiting, &terminals, workspace, terminal_handle);
+    drop(awaiting);
+    drop(terminals);
     match candidate {
         Some(task_id) => {
             sched
@@ -196,6 +193,34 @@ pub fn on_ready(
             Ok(())
         }
     }
+}
+
+/// Pure matcher for on_ready: handle-first, path second. Kept free of IO
+/// so the race contract is unit-tested without a database.
+fn match_candidate(
+    rows: &[crate::db::TaskRow],
+    awaiting: &HashMap<String, std::time::Instant>,
+    terminals: &HashMap<String, String>,
+    workspace: &str,
+    terminal_handle: &str,
+) -> Option<String> {
+    let eligible = |r: &crate::db::TaskRow| {
+        (r.state == crate::db::TaskState::Pending
+            || r.state == crate::db::TaskState::Running)
+            && r.to_ws == workspace
+            && (awaiting.contains_key(&r.task_id) || terminals.contains_key(&r.task_id))
+    };
+    if !terminal_handle.is_empty() {
+        if let Some(hit) = rows.iter().find(|r| {
+            eligible(r) && terminals.get(&r.task_id).map(String::as_str) == Some(terminal_handle)
+        }) {
+            return Some(hit.task_id.clone());
+        }
+    }
+    rows.iter()
+        .filter(|r| eligible(r))
+        .map(|r| r.task_id.clone())
+        .next()
 }
 
 fn deliver_to_terminal(
@@ -475,6 +500,30 @@ mod sched_tests {
         assert_eq!(s.db.get("p").unwrap().unwrap().state, TaskState::Running);
         let tail = s.db.ledger(10).unwrap();
         assert!(tail.iter().any(|e| e.task_id == "c" && e.state == "failed"));
+    }
+
+    #[test]
+    fn ready_matches_own_terminal_first() {
+        use crate::db::TaskState;
+        let s = test_sched();
+        seed(&s, "own", "a", "", TaskState::Running);
+        seed(&s, "other", "a", "", TaskState::Running);
+        s.terminals.lock().unwrap().insert("own".into(), "term-OWN".into());
+        s.terminals.lock().unwrap().insert("other".into(), "term-OTHER".into());
+        s.awaiting_ready.lock().unwrap().insert("own".into(), std::time::Instant::now());
+        s.awaiting_ready.lock().unwrap().insert("other".into(), std::time::Instant::now());
+        // The rows list newest-first; path-only matching would pick "other".
+        // Handle-first matching must pick the task whose terminal we created.
+        let rows = s.db.list(None, 200).unwrap();
+        let awaiting = s.awaiting_ready.lock().unwrap();
+        let terminals = s.terminals.lock().unwrap();
+        let hit = match_candidate(&rows, &awaiting, &terminals, "a", "term-OWN");
+        assert_eq!(hit.as_deref(), Some("own"));
+        // Unknown handle falls back to path matching without panic.
+        let hit = match_candidate(&rows, &awaiting, &terminals, "a", "term-STRANGER");
+        assert!(hit == Some("own".into()) || hit == Some("other".into()));
+        // Wrong workspace matches nothing.
+        assert_eq!(match_candidate(&rows, &awaiting, &terminals, "b", "term-OWN"), None);
     }
 
     #[test]

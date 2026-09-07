@@ -51,6 +51,7 @@ cleanup() {
   pkill -f "stub_e2e1.py $E2E_ROOT" 2>/dev/null || true
   pkill -f "stub_fanout_" 2>/dev/null || true
   pkill -f "stub_loop.py $E2E_ROOT" 2>/dev/null || true
+  pkill -f "stub_parked_ready.py" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -151,6 +152,11 @@ PY
   log "seed $id"
   python3 "$REPO/stub_loop.py" "$(wsdir a)" a "loop-a-$MARK" b "$E2E_ROOT" &
   python3 "$REPO/stub_loop.py" "$(wsdir b)" b "loop-b-$MARK" a "$E2E_ROOT" &
+  # Online-session case (root-workspace variant of the 5f459ff5 incident): a
+  # manual ready terminal is parked on workspace b BEFORE the loop seed is
+  # submitted. The seed's dispatch must still open its own session and close
+  # it via out; the parked handle must not steal the delivery.
+  python3 "$REPO/stub_parked_ready.py" "$(wsdir b)" b "parked-$MARK" &
   sleep 45
   local before; before=$(cd "$E2E_ROOT" && swarm list 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
   ((before >= 5)) || die "E2E-3 loop did not self-excite (tasks=$before)"

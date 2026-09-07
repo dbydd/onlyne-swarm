@@ -67,6 +67,9 @@ fn reap_loop(sched: Arc<Sched>) {
             }
         }
         // Ready timeout 120s: terminal created but no swarm_ready.
+        // Guard: a task that already has a ready terminal (recorded handle
+        // differs from the stub placeholder or the out already landed) is
+        // not a stall — reaping it would kill a live working session.
         {
             let timed_out: Vec<String> = sched
                 .awaiting_ready
@@ -77,7 +80,16 @@ fn reap_loop(sched: Arc<Sched>) {
                 .map(|(k, _)| k.clone())
                 .collect();
             for task_id in timed_out {
+                let delivered = sched.db.get(&task_id).ok().flatten().map(|r| {
+                    !r.terminal.is_empty()
+                        && !r.terminal.starts_with("stub-")
+                        && (r.state == crate::db::TaskState::Running
+                            || r.state == crate::db::TaskState::Done)
+                }).unwrap_or(false);
                 sched.awaiting_ready.lock().unwrap().remove(&task_id);
+                if delivered {
+                    continue;
+                }
                 sched.emit(
                     "task_stalled_ready_timeout",
                     serde_json::json!({"task_id": task_id}),
