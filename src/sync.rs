@@ -47,7 +47,7 @@ pub struct SyncReport {
     pub orphans: Vec<String>,
     pub dangling: Vec<String>,
     pub workspaces: usize,
-    /// Orca hierarchy notes, one per non-root workspace.
+    /// Orca cleanup notes: stale ghost nodes sync could not remove.
     #[serde(default)]
     pub hierarchy: Vec<String>,
 }
@@ -111,27 +111,23 @@ pub fn run_sync(root: &Path) -> anyhow::Result<SyncReport> {
     Ok(report)
 }
 
-/// Best-effort Orca node registration per workspace. Never fails sync;
-/// records the outcome. Each `.ws/<name>` becomes a folder-kind node
-/// (`swarm:<tree-path>` display name) so hop terminals land as tabs under
-/// their own workspace node instead of piling up under the root worktree.
+/// Best-effort Orca node cleanup per workspace. Folder-kind nodes are Orca-side
+/// metadata with no directory backlink: deleting `.ws/<name>` leaves a ghost
+/// node that renders as Unknown. sync removes leftovers instead of creating
+/// nodes (registration is disabled: ghost nodes are unlistable and hide tabs).
+/// Never fails sync; records the outcome.
 fn register_hierarchy(root: &Path, tree: &[Effective], report: &mut SyncReport) {
     use crate::hierarchy::HierarchyOutcome;
-    let project = crate::hierarchy::root_project(root);
     for e in tree {
         if e.path.is_empty() {
-            continue; // root is already an Orca worktree; nothing to attach
+            continue; // root is already an Orca worktree; nothing to clean
         }
         let ws = crate::root::resolve_instance(root, &e.path);
         let name = crate::hierarchy::node_display_name(&e.path);
-        match crate::hierarchy::ensure_child(project.as_deref(), &ws, &name) {
-            HierarchyOutcome::Attached { worktree_id } => report.hierarchy.push(format!(
-                "{}: node {}",
-                display_path(&e.path),
-                worktree_id
-            )),
-            HierarchyOutcome::Unsupported => report.hierarchy.push(format!(
-                "{}: node skipped (Orca registration failed; tabs fall back to root worktree)",
+        match crate::hierarchy::ensure_child(None, &ws, &name) {
+            HierarchyOutcome::Clean => {}
+            HierarchyOutcome::Stale { detail } => report.hierarchy.push(format!(
+                "{}: stale orca node ({detail})",
                 display_path(&e.path)
             )),
             HierarchyOutcome::Skipped => {}

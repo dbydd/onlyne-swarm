@@ -24,9 +24,10 @@ ratatui 实现的 swarm.sock 客户端（2s 全量轮询 + 事件驱动刷新）
 
 - 左树：workspace 层级；`●` daemon 在线，`○` 离线；`back_edges` 用虚线 + `╰╴` 标注。
   每个节点下挂该 workspace 的 hop 行（`· id8 [state]`），选中行标 `▶`，带真实
-  terminal 的行加 `◉`。这是 Orca hierarchy 的 TUI 镜像：Orca 侧看不到父子链
-  （跨 repo `set --parent-worktree` 被拒），这里按 `.ws/` 树把同 workspace 的
-  hop 收成同层 tab，同节点的多个 `◉` 行即 Orca 里的多个兄弟 tab。
+  terminal 的行加 `◉`。这是 Orca 侧没有的东西的 TUI 替代：folder-kind 节点
+  在 Orca 里不可见（只剩 Unknown 幽灵分组），这里按 `.ws/` 树把同 workspace
+  的 hop 收成同组行，同节点的多个 `◉` 行对应 Orca 根 worktree 下标题相同的
+  多个兄弟 tab。
   格式化逻辑在 `tui.rs::tree_tab_lines`，纯函数，有单测覆盖。
 - 右上任务表：`task_id` 短显（前 8）、`from → to`、`attempt`、`state`
  （pending/running/done/failed/cancelled/closed）、`xfer` 血缘短 id。

@@ -121,14 +121,13 @@ the plugin swarm tools.
 
 ## Visibility in Orca
 
-`sync` registers each `.ws/<name>` as a folder-kind Orca node in the same
-project (display-name `swarm:<tree-path>`); each hop terminal is created
-with `--worktree path:<workspace dir>` so it lands as a tab under its own
-workspace node. Same-workspace concurrent hops are sibling `swarm:<to>:<id8>`
-tabs under that node. Tab titles are re-pinned by the session on claim and on
-idle (pi overwrites the create-time title on boot). Nodes are display-layer
-only: `.ws/*` stay plain dirs in one checkout, no git worktrees. Set
-`SWARM_FOCUS=all` (or `new`) in the scheduler environment to reveal each
+Hop terminals live under the swarm root worktree as background tabs titled
+`swarm:<to>:<id8>` (session re-pins on claim and on idle; pi overwrites the
+create-time title on boot). Same-workspace concurrent hops are sibling tabs
+sharing the title prefix — find a session by title, not by sidebar structure.
+Do NOT register folder-kind nodes: they are invisible in `worktree list` and
+`terminal list` and render as Unknown ghosts; `sync` removes leftovers instead.
+Set `SWARM_FOCUS=all` (or `new`) in the scheduler environment to reveal each
 created terminal; leave it unset during fan-out.
 
 ## Monitor and cancel

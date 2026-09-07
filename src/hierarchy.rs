@@ -1,22 +1,12 @@
 use std::process::Command;
 
-/// Orca hierarchy registration: one folder-kind node per workspace dir.
-///
-/// Hand-verified facts (live CLI probes, see commit history):
-/// - `project setup-existing-folder --kind folder` registers the dir as an
-///   addressable worktree (`worktree show --worktree path:<canon-dir>` resolves
-///   it; Orca canonicalizes symlinked prefixes, so callers must pass the
-///   canonical path — an uncanonicalized /tmp/... selector_not_founds while
-///   /private/tmp/... resolves).
-/// - `terminal create --worktree path:<node-dir>` lands the tab under that
-///   node; same-workspace concurrent hops are sibling tabs (verified: 2 tabs
-///   under one node). Selector must also be canonicalized.
-/// - `worktree set --parent-worktree` across repos is refused
-///   (LINEAGE_PARENT_CONTEXT_CONFLICT), so nodes stay same-level siblings —
-///   no parent/child chain. That is fine: visibility comes from node + tab
-///   placement, not lineage.
-/// - `worktree create` always makes a NEW checkout elsewhere — never usable
-///   for pointing at an existing `.ws/<name>` dir.
+/// Orca node cleanup: folder-kind nodes are Orca-side metadata only and are
+/// NOT reclaimed when their directories disappear. Live field evidence
+/// (0.3.0 rollout): nodes neither appear in `worktree list` nor resolve via
+/// `worktree show`, and tabs created `--worktree path:<node>` are absent from
+/// `terminal list` — the UI shows Unknown groups instead. So registration is
+/// disabled: this module only removes leftover nodes. Visibility lives in the
+/// TUI tree (`f` focuses the hop tab under the root worktree).
 
 fn orca() -> Command {
     let bin = std::env::var("ORCA_CLI_COMMAND").unwrap_or_else(|_| "orca".into());
@@ -32,18 +22,18 @@ fn run_json(mut cmd: Command) -> Option<serde_json::Value> {
     serde_json::from_slice(&out.stdout).ok()
 }
 
-/// True when the Orca runtime answers. Hierarchy registration is skipped
-/// entirely when Orca is unreachable (headless e2e, non-macOS, no Orca).
+/// True when the Orca runtime answers. Cleanup is skipped entirely when
+/// Orca is unreachable (headless e2e, non-macOS, no Orca).
 pub fn reachable() -> bool {
     let mut cmd = orca();
     cmd.args(["status"]);
     run_json(cmd).is_some()
 }
 
-/// Probe whether an existing dir is already an addressable Orca worktree.
-/// Returns the worktree id when found. Canonicalizes first: Orca resolves
-/// symlinked prefixes (macOS /tmp -> /private/tmp) and an uncanonicalized
-/// selector will selector_not_found even when the node exists.
+/// Probe whether a dir is currently an addressable Orca worktree.
+/// Canonicalizes first: Orca resolves symlinked prefixes (macOS
+/// /tmp -> /private/tmp); an uncanonicalized selector selector_not_founds
+/// even when the node exists.
 pub fn show_worktree_id(dir: &std::path::Path) -> Option<String> {
     let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let mut cmd = orca();
@@ -58,9 +48,8 @@ pub fn show_worktree_id(dir: &std::path::Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Outcome of ensuring one workspace node exists.
-
 /// Display name for a workspace node: `swarm:<tree-path>`, root is `swarm:.`.
+/// Kept for the TUI tree labels and tab titles (same namespace, no Orca call).
 pub fn node_display_name(tree_path: &str) -> String {
     if tree_path.is_empty() {
         "swarm:.".to_string()
@@ -69,68 +58,67 @@ pub fn node_display_name(tree_path: &str) -> String {
     }
 }
 
-/// Register `dir` as a folder-kind Orca node with a stable display name.
-/// Idempotent: an already-registered dir resolves via `show` and only gets
-/// its display name re-asserted. Returns the worktree id on success.
-pub fn ensure_node(
-    project: &str,
-    dir: &std::path::Path,
-    display_name: &str,
-) -> anyhow::Result<String> {
-    if let Some(id) = show_worktree_id(dir) {
-        let mut cmd = orca();
-        cmd.args(["worktree", "set", "--worktree"]);
-        cmd.arg(format!("path:{}", dir.display()));
-        cmd.args(["--display-name", display_name]);
-        let _ = run_json(cmd); // best effort; id already known
-        return Ok(id);
-    }
-    let mut cmd = orca();
-    cmd.args([
-        "project",
-        "setup-existing-folder",
-        "--project",
-        project,
-        "--host",
-        "local",
-        "--path",
-    ]);
-    cmd.arg(dir);
-    cmd.args(["--kind", "folder", "--display-name", display_name]);
-    let v = run_json(cmd).unwrap_or(serde_json::Value::Null);
-    if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
-        anyhow::bail!("setup-existing-folder failed for {}: {v}", dir.display());
-    }
-    show_worktree_id(dir)
-        .ok_or_else(|| anyhow::anyhow!("registered {} but not addressable", dir.display()))
-}
-
-/// Outcome of ensuring one workspace node exists.
+/// Outcome of cleaning one workspace node.
 pub enum HierarchyOutcome {
-    /// Node registered (or already present), addressable by path.
-    Attached { worktree_id: String },
-    /// Registration failed; hop tabs fall back to the root worktree.
-    Unsupported,
+    /// No node existed, or the leftover was removed.
+    Clean,
+    /// Removal failed; logged, never fatal to sync.
+    Stale { detail: String },
     /// Orca unreachable; caller logs and continues.
     Skipped,
 }
 
-/// Ensure the folder-kind node for one workspace dir exists, with the given
-/// display name. Best effort: any failure maps to Unsupported so sync never
-/// breaks; the hop still runs, its tab just lands under the root worktree.
-pub fn ensure_child(project: Option<&str>, dir: &std::path::Path, display_name: &str) -> HierarchyOutcome {
+/// Remove the folder-kind node for one workspace dir if present.
+/// Best effort; never fails sync.
+pub fn ensure_child(_project: Option<&str>, dir: &std::path::Path, _display_name: &str) -> HierarchyOutcome {
     if !reachable() {
         return HierarchyOutcome::Skipped;
     }
-    let project = project.unwrap_or("github:dbydd/onlyne");
-    match ensure_node(project, dir, display_name) {
-        Ok(worktree_id) => HierarchyOutcome::Attached { worktree_id },
-        Err(_) => HierarchyOutcome::Unsupported,
+    let Some(id) = show_worktree_id(dir) else {
+        return HierarchyOutcome::Clean;
+    };
+    // Derive the setup id: `show` does not return it directly, so list
+    // setups and match by canonical path.
+    let setup_id = list_setup_for(dir);
+    if let Some(setup) = setup_id {
+        let mut cmd = orca();
+        cmd.args(["project", "setup-delete", "--setup", &setup]);
+        match run_json(cmd) {
+            Some(v) if v.get("ok").and_then(|o| o.as_bool()) == Some(true) => {
+                return HierarchyOutcome::Clean
+            }
+            _ => {
+                return HierarchyOutcome::Stale {
+                    detail: format!("{id} setup-delete refused"),
+                }
+            }
+        }
     }
+    // Addressable worktree but no matching setup: leave it, report stale.
+    HierarchyOutcome::Stale {
+        detail: format!("{id} has no matching project setup"),
+    }
+}
+
+fn list_setup_for(dir: &std::path::Path) -> Option<String> {
+    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut cmd = orca();
+    cmd.args(["project", "setups"]);
+    let v = run_json(cmd)?;
+    let setups = v.pointer("/result/setups")?.as_array()?;
+    for s in setups {
+        let p = s.get("path")?.as_str()?;
+        let canon_p = std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+        if canon_p == canon {
+            return s.get("id")?.as_str().map(String::from);
+        }
+    }
+    None
 }
 
 /// Derive the Orca project id for the swarm root from its git origin.
 /// Falls back to None (caller substitutes a default); never fails.
+/// Kept for future use; registration is currently disabled.
 pub fn root_project(root: &std::path::Path) -> Option<String> {
     let out = Command::new("git")
         .args(["-C"])
