@@ -121,16 +121,15 @@ the plugin swarm tools.
 
 ## Visibility in Orca
 
-Hop terminals live under the swarm root's single Orca worktree as background
-tabs titled `swarm:<to>:<id8>` (session re-pins on claim and on idle; pi
-overwrites the create-time title on boot). They do not appear as separate
-worktrees: attaching an existing `.ws/<name>` dir as an Orca child worktree
-has no CLI path (verified V1–V5: folder-kind and repo-add entities are not
-selector-addressable, cross-repo `set --parent-worktree` is refused,
-`worktree create` always makes a new checkout elsewhere). `sync` probes and
-reports this per workspace instead of failing. Set `SWARM_FOCUS=all` (or
-`new`) in the scheduler environment to reveal each created terminal; leave
-it unset during fan-out.
+`sync` registers each `.ws/<name>` as a folder-kind Orca node in the same
+project (display-name `swarm:<tree-path>`); each hop terminal is created
+with `--worktree path:<workspace dir>` so it lands as a tab under its own
+workspace node. Same-workspace concurrent hops are sibling `swarm:<to>:<id8>`
+tabs under that node. Tab titles are re-pinned by the session on claim and on
+idle (pi overwrites the create-time title on boot). Nodes are display-layer
+only: `.ws/*` stay plain dirs in one checkout, no git worktrees. Set
+`SWARM_FOCUS=all` (or `new`) in the scheduler environment to reveal each
+created terminal; leave it unset during fan-out.
 
 ## Monitor and cancel
 

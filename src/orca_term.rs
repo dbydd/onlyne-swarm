@@ -55,13 +55,19 @@ impl Default for CreateOpts {
 }
 
 /// Pure argv constructor so focus/worktree wiring is unit-tested.
-pub fn create_argv(title: &str, focus: bool) -> Vec<String> {
-    let mut argv = vec![
-        "terminal".to_string(),
-        "create".to_string(),
-        "--title".to_string(),
-        title.to_string(),
-    ];
+/// `worktree_dir` selects the Orca worktree the tab belongs to
+/// (`terminal create --worktree path:<dir>`); None keeps current behavior.
+pub fn create_argv(title: &str, focus: bool, worktree_dir: Option<&std::path::Path>) -> Vec<String> {
+    let mut argv = vec!["terminal".to_string(), "create".to_string()];
+    if let Some(dir) = worktree_dir {
+        // Canonicalize: Orca resolves symlinked prefixes (/tmp -> /private/tmp)
+        // and an uncanonicalized --worktree path selector_not_founds.
+        let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        argv.push("--worktree".to_string());
+        argv.push(format!("path:{}", canon.display()));
+    }
+    argv.push("--title".to_string());
+    argv.push(title.to_string());
     if focus {
         argv.push("--focus".to_string());
     }
@@ -81,7 +87,7 @@ pub fn create_with_opts(
         });
     }
     let mut cmd = orca();
-    cmd.args(create_argv(title, opts.focus));
+    cmd.args(create_argv(title, opts.focus, Some(cwd)));
     // Keep normal extension discovery enabled so retry and other configured
     // extensions are available in real swarm sessions.
     cmd.arg(session_command(cwd, env_task));
@@ -222,14 +228,30 @@ mod tests {
     fn create_argv_focus_is_opt_in() {
         // Default: background tab, no focus steal during fan-out.
         assert_eq!(
-            create_argv("swarm:a:12345678", false),
+            create_argv("swarm:a:12345678", false, None),
             vec!["terminal", "create", "--title", "swarm:a:12345678", "--command"]
         );
         assert_eq!(
-            create_argv("swarm:a:12345678", true).last().map(String::as_str),
+            create_argv("swarm:a:12345678", true, None).last().map(String::as_str),
             Some("--command")
         );
-        assert!(create_argv("t", true).contains(&"--focus".to_string()));
+        assert!(create_argv("t", true, None).contains(&"--focus".to_string()));
+    }
+
+    #[test]
+    fn create_argv_pins_tab_to_workspace_node() {
+        // Hop tabs belong to their workspace dir node, not the root worktree.
+        // /tmp/a is a real dir here so canonicalize passes through.
+        let argv = create_argv(
+            "swarm:model:12345678",
+            false,
+            Some(std::path::Path::new("/tmp")),
+        );
+        let flat: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let i = flat.iter().position(|a| *a == "--worktree").expect("has --worktree");
+        assert!(flat[i + 1].starts_with("path:"), "{}", flat[i + 1]);
+        assert!(flat[i + 1].ends_with("/tmp") || flat[i + 1].ends_with("/private/tmp"), "{}", flat[i + 1]);
+        assert!(i < flat.iter().position(|a| *a == "--title").unwrap());
     }
 
     #[test]

@@ -129,6 +129,9 @@ async fn main() -> anyhow::Result<()> {
             for d in &report.dangling {
                 println!("dangling-link: {d}");
             }
+            for h in &report.hierarchy {
+                println!("orca-node: {h}");
+            }
             let _db = db::Db::open(&root_p)?;
             let mut children = daemon::ensure_all(&root_p)?;
             println!("onlyne-swarm scheduler running at {}", root_p.display());

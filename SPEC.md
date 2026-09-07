@@ -83,19 +83,21 @@ attempt: <整数，首次为 1>
 - 职责：根据 cwd 递归管理各工作区；监视对应 out 端，收到任务后创建 session，
   把任务插入 session 的 pi-onlyne 任务队列；out 落地即记 done + 台账并回收 terminal。
   无回调转发，无等待记账。
-- Orca 映射：整个 swarm 树是一个 Orca worktree（SPEC §12：子工作区就是目录，
-  不做 git/worktree 映射——嵌套目录不注册 folder context，swarm 树在 Orca 工作区
-  结构里只表现为根 worktree 下的一组 terminal tab），每个 session 是一个 orca
-  terminal（`terminal create` + pi 命令）。terminal 与 pi 进程视为一回事：
-  调度器结束 pi 进程，orca 自动回收 terminal。不维护常驻 idle 池（空闲是瞬态），
-  允许实现一个按 workspace 路径分组的瞬态 ready 池应对突发并发，超期无任务认领即回收。
+- Orca 映射：swarm root 是一个 Orca worktree；`sync` 把每个 `.ws/<name>`
+  注册为同 project 下的 folder-kind 节点（display-name `swarm:<tree-path>`，
+  见 `src/hierarchy.rs`），每个 hop 的 terminal 经
+  `terminal create --worktree path:<workspace dir>` 落在自己 workspace 的节点下
+  成为同层 tab。terminal 与 pi 进程视为一回事：调度器结束 pi 进程，orca
+  自动回收 terminal。不维护常驻 idle 池（空闲是瞬态），允许实现一个按
+  workspace 路径分组的瞬态 ready 池应对突发并发，超期无任务认领即回收。
+  （SPEC §12 的“无 git 映射”保留：folder-kind 节点只动 Orca 元数据层，
+  `.ws/*` 仍是同一 checkout 内的普通目录，不建 git worktree；跨 repo 的
+  `set --parent-worktree` 不可用，故节点间不挂父子链——同层节点 + tab
+  归属即层级可见性的全部。）
 - 可见性：terminal 默认建在后台（`create` 不带 `--focus`，`SWARM_FOCUS=all|new`
   可选 opt-in；fan-out 下默认抢焦点不可用）。标题由 session 侧钉选（claim 时 +
-  每次 idle，`43d7a80`，谁最后写谁赢）。层级映射经 V1–V5 手测证伪：
-  Orca CLI 无法把已存在的 `.ws/<name>` 目录挂成根 worktree 的子节点
-  （folder-kind/repo-add 实体不可寻址、跨 repo 挂父被拒、`worktree create`
-  恒建新 checkout），hop tab 保持根下 `swarm:*` 平铺；`sync` 逐 workspace
-  探测并报告，不中断。见 `src/hierarchy.rs`。
+  每次 idle，`43d7a80`，谁最后写谁赢）。同层 session 落为同节点下的 tab：
+  同 workspace 的并发 hop 是该节点的多个 `swarm:<to>:<id8>` tab。
 - 投递时序：`orca terminal create` 起 pi 有启动延迟。pi-onlyne swarm 模式启动后向本地 daemon
   发送新增的 `swarm_ready` 操作（载荷：workspace 路径 + 自报 terminal 句柄 + 时间戳，
   句柄只做 TUI 展示与 kill 用）。调度器经事件订阅收集 ready 信号，按 workspace 路径匹配

@@ -114,13 +114,34 @@ pub fn run_sync(root: &Path) -> anyhow::Result<SyncReport> {
 
 /// Best-effort Orca hierarchy probe per workspace (SPEC amendment 2,
 /// verified V1–V5 negative). Never fails sync; records the outcome.
+/// Node registration is best-effort per workspace: reachable Orca gets a
+/// folder-kind node per dir (`swarm:<tree-path>` display name); failures
+/// keep flat-tab behavior and are recorded, never fatal.
 fn register_hierarchy(root: &Path, tree: &[Effective], report: &mut SyncReport) {
     use crate::hierarchy::HierarchyOutcome;
+    let project = crate::hierarchy::root_project(root);
     for e in tree {
         if e.path.is_empty() {
             continue; // root is already an Orca worktree; nothing to attach
         }
         let ws = crate::root::resolve_instance(root, &e.path);
+        // Register the folder-kind node first; ensure_child then probes it.
+        if crate::hierarchy::reachable() {
+            let name = crate::hierarchy::node_display_name(&e.path);
+            match crate::hierarchy::ensure_node(
+                project.as_deref().unwrap_or("github:dbydd/onlyne"),
+                &ws,
+                &name,
+            ) {
+                Ok(id) => {
+                    report.hierarchy.push(format!("{}: node {}", display_path(&e.path), id));
+                    continue;
+                }
+                Err(err) => {
+                    report.hierarchy.push(format!("{}: node skipped ({err})", display_path(&e.path)));
+                }
+            }
+        }
         match crate::hierarchy::ensure_child(root, &ws) {
             HierarchyOutcome::Attached { worktree_id } => report.hierarchy.push(format!(
                 "{}: attached as {}",
