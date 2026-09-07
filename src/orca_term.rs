@@ -108,6 +108,25 @@ pub fn rename(handle: &str, title: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Shell argv for `orca terminal switch --terminal <h>`.
+pub fn focus_argv(handle: &str) -> Vec<String> {
+    vec![
+        "terminal".to_string(),
+        "switch".to_string(),
+        "--terminal".to_string(),
+        handle.to_string(),
+    ]
+}
+
+/// Switch the Orca UI to a terminal tab. Best effort: a stale/closed handle
+/// just reports the error as the status message, never breaks the TUI loop.
+pub fn focus(handle: &str) -> anyhow::Result<()> {
+    let mut cmd = orca();
+    cmd.args(focus_argv(handle));
+    run_json(cmd)?;
+    Ok(())
+}
+
 pub fn close(handle: &str) -> anyhow::Result<()> {
     let mut cmd = orca();
     cmd.args(["terminal", "close", "--terminal", handle]);
@@ -252,6 +271,14 @@ mod tests {
         assert!(flat[i + 1].starts_with("path:"), "{}", flat[i + 1]);
         assert!(flat[i + 1].ends_with("/tmp") || flat[i + 1].ends_with("/private/tmp"), "{}", flat[i + 1]);
         assert!(i < flat.iter().position(|a| *a == "--title").unwrap());
+    }
+
+    #[test]
+    fn focus_argv_shape() {
+        assert_eq!(
+            focus_argv("term_abc"),
+            vec!["terminal", "switch", "--terminal", "term_abc"]
+        );
     }
 
     #[test]

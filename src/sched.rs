@@ -533,6 +533,24 @@ mod sched_tests {
     }
 
     #[test]
+    fn tree_groups_hops_under_their_workspace_and_marks_focusable_tab() {
+        let workspaces = vec![
+            serde_json::json!({"path": "."}),
+            serde_json::json!({"path": "model"}),
+        ];
+        let tasks = vec![
+            serde_json::json!({"task_id": "root-task-abcdefgh", "to_ws": ".", "state": "running", "terminal": "term_root"}),
+            serde_json::json!({"task_id": "model-task-abcdefgh", "to_ws": "model", "state": "running", "terminal": "term_model"}),
+            serde_json::json!({"task_id": "old-model-abcdefgh", "to_ws": "model", "state": "closed", "terminal": ""}),
+        ];
+        let lines = crate::tui::tree_tab_lines(&workspaces, &tasks, 1);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("root-tas") && lines[0].contains("◉"));
+        assert!(lines[1].starts_with("▶ model-ta") && lines[1].contains("◉"));
+        assert!(lines[2].starts_with("· old-mode") && !lines[2].contains("◉"));
+    }
+
+    #[test]
     fn render_snapshot_shapes() {
         let tasks = vec![
             serde_json::json!({"task_id": "abcdefgh-1234", "from_ws": ".", "to_ws": "a",

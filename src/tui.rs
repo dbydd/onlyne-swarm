@@ -12,9 +12,10 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table},
 };
 
-/// Ratatui monitoring panel (TUI.md): left tree (workspaces + back_edges),
-/// upper-right task table, lower-right daemons/terminals + dead-letter,
-/// status bar with cancel / toggle-swarm / quit keys.
+/// Ratatui monitoring panel (TUI.md): left tree (workspaces + back_edges +
+/// live hop tabs grouped under their workspace node), upper-right task table,
+/// lower-right daemons/terminals + dead-letter, status bar with cancel /
+/// toggle-swarm / focus-tab / quit keys.
 ///
 /// Data: full `list_workspaces` + `list_tasks` pulls every 2s plus a
 /// `subscribe` stream for sub-second task events. Alerts render red but never
@@ -55,6 +56,41 @@ pub fn snapshot_for_test(
     tasks: Vec<serde_json::Value>,
 ) -> Snapshot {
     Snapshot { status, workspaces, tasks }
+}
+
+/// Pure tree-line formatter for the left workspace panel: one line per hop
+/// tab grouped under its workspace node. Format: `{marker} {id8} [{state}]{live}`.
+/// `selected` marks the ▶ line; live sessions (real, non-stub handle) get ◉.
+/// Used by `render` and by the tree regression test in sched.rs.
+pub fn tree_tab_lines(
+    workspaces: &[serde_json::Value],
+    tasks: &[serde_json::Value],
+    selected: usize,
+) -> Vec<String> {
+    let mut out = vec![];
+    for w in workspaces {
+        let path = w.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let node_path = path;
+        for (i, t) in tasks.iter().enumerate() {
+            let to = t.get("to_ws").and_then(|v| v.as_str()).unwrap_or("");
+            if to != node_path {
+                continue;
+            }
+            let id = t.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let st = t.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+            let handle = t.get("terminal").and_then(|v| v.as_str()).unwrap_or("");
+            let marker = if i == selected { "▶" } else { "·" };
+            let live = if handle.is_empty() || handle.starts_with("stub-") { "" } else { " ◉" };
+            out.push(format!(
+                "{} {} [{}]{}",
+                marker,
+                id.get(..8.min(id.len())).unwrap_or(id),
+                st,
+                live,
+            ));
+        }
+    }
+    out
 }
 
 /// Pure row formatter for the task table: `id8 | from->to | att | state | xfer8`.
@@ -138,6 +174,24 @@ fn run_loop(
                             snap = pull(sock);
                         }
                     }
+                    KeyCode::Char('f') | KeyCode::Enter => {
+                        // Focus the Orca tab of the selected task's session.
+                        // Equivalent to clicking the tab: reveals the hop's
+                        // terminal in the Orca UI. Stale/closed handles report
+                        // the orca error as the status message.
+                        if let Some(t) = snap.tasks.get(selected) {
+                            let handle = t.get("terminal").and_then(|v| v.as_str()).unwrap_or("");
+                            let id8 = t.get("task_id").and_then(|v| v.as_str()).map(|id| &id[..8.min(id.len())]).unwrap_or("?");
+                            if handle.is_empty() || handle.starts_with("stub-") {
+                                msg = format!("no live tab for {id8}");
+                            } else {
+                                match crate::orca_term::focus(handle) {
+                                    Ok(_) => msg = format!("focused {id8}"),
+                                    Err(e) => msg = format!("focus failed: {e}"),
+                                }
+                            }
+                        }
+                    }
                     KeyCode::Char('t') => {
                         // Toggle swarm for the root workspace.
                         let enabled = snap
@@ -186,7 +240,10 @@ fn render(
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(main[1]);
 
-    // Left: workspace tree with back_edges dashed lines.
+    // Left: workspace tree with back_edges dashed lines plus live hop tabs
+    // grouped under their workspace node (orca-side hierarchy mirror:
+    // same-workspace hops are sibling tabs, `swarm:<to>:<id8>`).
+    // Selected task's tab gets the ▶ marker.
     let mut items: Vec<ListItem> = vec![];
     for w in &snap.workspaces {
         let path = w.get("path").and_then(|v| v.as_str()).unwrap_or("?");
@@ -206,6 +263,10 @@ fn render(
                     "{indent}  ╰╴ {tgt} (back_edge)"
                 )));
             }
+        }
+        // Hop tabs under this node (shared formatter, also unit-tested).
+        for line in tree_tab_lines(&[w.clone()], &snap.tasks, selected) {
+            items.push(ListItem::new(format!("{indent}  {line}")));
         }
     }
     // Orphan / alert lines from status.
@@ -274,17 +335,47 @@ fn render(
         right[0],
     );
 
-    // Lower right: daemons/terminals + dead-letter + status json.
-    let status_txt = serde_json::to_string_pretty(&snap.status).unwrap_or_default();
+    // Lower right: ledger tail (last finished hops) + state counts.
+    // Previously this dumped the raw status JSON; now it shows the
+    // human-readable ledger so the operator sees what finished and why.
+    let mut detail = vec![];
+    if let Some(counts) = snap.status.get("tasks_by_state") {
+        detail.push(format!("tasks: {counts}"));
+    }
+    if let Some(ledger) = snap.status.get("ledger_tail").and_then(|v| v.as_array()) {
+        detail.push("ledger (latest first):".to_string());
+        for e in ledger.iter().take(8) {
+            let id = e.get("task_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let st = e.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+            let to = e.get("to_ws").and_then(|v| v.as_str()).unwrap_or("?");
+            let reason = e.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+            let head = e.get("out_head").and_then(|v| v.as_str()).unwrap_or("");
+            let extra = if reason.is_empty() {
+                head.get(..60.min(head.len())).unwrap_or(head).replace('\n', " ")
+            } else {
+                reason.get(..80.min(reason.len())).unwrap_or(reason).to_string()
+            };
+            detail.push(format!(
+                "{} {}->{} {}",
+                id.get(..8.min(id.len())).unwrap_or(id),
+                to,
+                st,
+                extra,
+            ));
+        }
+    }
+    if detail.is_empty() {
+        detail.push("(no ledger entries yet)".to_string());
+    }
     f.render_widget(
-        Paragraph::new(status_txt)
-            .block(Block::default().title("daemons / status").borders(Borders::ALL)),
+        Paragraph::new(detail.join("\n"))
+            .block(Block::default().title("ledger").borders(Borders::ALL)),
         right[1],
     );
 
     f.render_widget(
         Paragraph::new(format!(
-            "[↑↓/jk] select  [c]ancel family  [t]oggle swarm  [q]uit    {msg}"
+            "[↑↓/jk] select  [f/enter] focus orca tab  [c]ancel family  [t]oggle swarm  [q]uit    {msg}"
         ))
         .block(Block::default().title("keys").borders(Borders::ALL)),
         root[1],
