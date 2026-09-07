@@ -113,8 +113,11 @@ onlyne-swarm list --state running
 
 `run` syncs once, starts missing daemons, subscribes to priority event
 streams, and serves `.onlyne/run/swarm.sock`. Each dispatch opens one Orca
-terminal with `pi`. The session sends `swarm_ready`, receives the persisted
-payload through follow-up, and completes through the plugin reply tools.
+terminal with `pi` (env `ONLYNE_SWARM_TASK` carries the assigned task id).
+The session sends `swarm_ready`, claims exactly that env task from history
+(stale history claims yield to it), receives the persisted payload through
+follow-up, pins its tab title to `swarm:<to>:<id8>`, and completes through
+the plugin swarm tools.
 
 ## Visibility in Orca
 
