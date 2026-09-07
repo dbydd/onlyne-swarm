@@ -56,6 +56,67 @@ fn reap_previous_run(sched: &Arc<Sched>) {
     }
 }
 
+/// One dead-terminal sweep iteration, extracted for unit testing.
+/// Returns (failed_task_ids, retried_task_ids).
+fn sweep_dead_terminals(sched: &Arc<Sched>) -> (Vec<String>, Vec<String>) {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut failed = vec![];
+    let mut retried = vec![];
+    // Dead-terminal sweep: a Running task whose orca tab is gone (pi
+    // exited without writing out) would otherwise sit in running
+    // forever. Detect via `terminal show`, record failed, and requeue
+    // with attempt+1 so the hop is retried in a fresh terminal.
+    // Attempt cap lives here, not in dispatch: dispatch stays dumb.
+    let running: Vec<(String, String, u32)> = sched
+        .db
+        .list(Some("running"), 200)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| !r.terminal.is_empty() && !r.terminal.starts_with("stub-"))
+        .map(|r| (r.task_id.clone(), r.terminal.clone(), r.attempt))
+        .collect();
+    for (task_id, handle, attempt) in running {
+        if crate::orca_term::is_alive(&handle) {
+            continue;
+        }
+        // Terminal dead, no out: failed + ledger, then retry or drop.
+        let _ = sched::on_early_exit(sched, &task_id, "terminal exited before out");
+        failed.push(task_id.clone());
+        if attempt < MAX_ATTEMPTS {
+            if let Ok(Some(task)) = sched.db.get(&task_id) {
+                let retry_id = uuid::Uuid::new_v4().to_string();
+                if sched
+                    .db
+                    .insert_task(
+                        &retry_id,
+                        &task.from_ws,
+                        &task.to_ws,
+                        &task.transfer_send_to,
+                        attempt + 1,
+                        &task.payload,
+                    )
+                    .unwrap_or(false)
+                {
+                    sched.emit(
+                        "task_retried",
+                        serde_json::json!({
+                            "task_id": retry_id,
+                            "from_failed": task_id,
+                            "attempt": attempt + 1,
+                        }),
+                    );
+                    // Best effort: orca may be unreachable in tests.
+                    let _ = sched::dispatch_public(&sched, &retry_id, &task.to_ws);
+                    retried.push(retry_id);
+                }
+            }
+        } else {
+            tracing::warn!(task = %task_id, attempt, "terminal dead, attempt cap reached; not retrying");
+        }
+    }
+    (failed, retried)
+}
+
 fn reap_loop(sched: Arc<Sched>) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(10));
@@ -66,6 +127,8 @@ fn reap_loop(sched: Arc<Sched>) {
                 handles.retain(|t| t.since.elapsed() < std::time::Duration::from_secs(60));
             }
         }
+        // Dead-terminal sweep lives in sweep_dead_terminals (unit-tested).
+        let (_failed, _retried) = sweep_dead_terminals(&sched);
         // Ready timeout 120s: terminal created but no swarm_ready.
         // Guard: a task that already has a ready terminal (recorded handle
         // differs from the stub placeholder or the out already landed) is
@@ -265,4 +328,54 @@ fn write_resp(
     });
     writeln!(w, "{msg}")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Db, TaskState};
+
+    fn test_sched() -> Arc<Sched> {
+        let dir = tempfile::tempdir().unwrap();
+        let root: &'static std::path::Path =
+            Box::leak(dir.path().join("root").into_boxed_path());
+        std::fs::create_dir_all(root).unwrap();
+        let _ = Box::leak(Box::new(dir));
+        let db = Db::open(root).unwrap();
+        Sched::new(root.to_path_buf(), db)
+    }
+
+    #[test]
+    fn dead_terminal_fails_and_retries_with_attempt_bump() {
+        // SWARM_STUB_AGENT=1 makes orca_term a no-op: is_alive("stub-*")
+        // returns true, so drive the sweep through a fake dead handle by
+        // pointing ORCA_CLI_COMMAND at /bin/false (run_json fails -> dead).
+        std::env::set_var("ORCA_CLI_COMMAND", "/bin/false");
+        let s = test_sched();
+        // Dead handle: orca unreachable -> is_alive false -> failed + retry.
+        s.db.insert_task("dead1", ".", "a", "", 1, "p").unwrap();
+        s.db.set_state("dead1", TaskState::Running).unwrap();
+        s.db.set_terminal("dead1", "term-dead-handle").unwrap();
+        let (failed, retried) = sweep_dead_terminals(&s);
+        assert_eq!(failed, vec!["dead1"]);
+        assert_eq!(retried.len(), 1);
+        assert_eq!(s.db.get("dead1").unwrap().unwrap().state, TaskState::Failed);
+        let r = s.db.get(&retried[0]).unwrap().unwrap();
+        assert_eq!(r.attempt, 2);
+        assert_eq!(r.to_ws, "a");
+        std::env::remove_var("ORCA_CLI_COMMAND");
+    }
+
+    #[test]
+    fn dead_terminal_at_cap_fails_without_retry() {
+        std::env::set_var("ORCA_CLI_COMMAND", "/bin/false");
+        let s = test_sched();
+        s.db.insert_task("dead3", ".", "a", "", 3, "p").unwrap();
+        s.db.set_state("dead3", TaskState::Running).unwrap();
+        s.db.set_terminal("dead3", "term-dead-handle").unwrap();
+        let (failed, retried) = sweep_dead_terminals(&s);
+        assert_eq!(failed, vec!["dead3"]);
+        assert!(retried.is_empty());
+        std::env::remove_var("ORCA_CLI_COMMAND");
+    }
 }

@@ -125,6 +125,21 @@ pub fn focus(handle: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Liveness probe: true while Orca still knows the handle. A dead tab
+/// (exited pi, closed tab, stale handle) answers ok:false, which the
+/// reaper treats as a terminal-dead signal. Pure best-effort read.
+pub fn is_alive(handle: &str) -> bool {
+    if handle.is_empty() || handle.starts_with("stub-") {
+        return true; // stubs have no orca tab; never declare them dead
+    }
+    let mut cmd = orca();
+    cmd.args(["terminal", "show", "--terminal", handle]);
+    match run_json(cmd) {
+        Ok(v) => v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 pub fn close(handle: &str) -> anyhow::Result<()> {
     let mut cmd = orca();
     cmd.args(["terminal", "close", "--terminal", handle]);
