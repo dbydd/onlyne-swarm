@@ -427,9 +427,10 @@ pub fn cancel_force(sched: &Arc<Sched>, task_id: &str, reason: &str, force: bool
     Ok(out)
 }
 
-/// Called when the session uplinks `swarm_recycled`. A worker quit is an
-/// explicit failure decision: close its ledger life immediately, never
-/// requeue. A normal done task was already closed by on_out, so it is a no-op.
+/// Called when the session uplinks `swarm_recycled`. A worker quit closes its
+/// ledger life immediately. Roots with `retry.max_attempts = 0` replay that
+/// whole task as attempt+1; every other root preserves explicit-quit stop.
+/// A normal done task was already closed by on_out, so it is a no-op.
 pub fn on_recycled(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::Result<()> {
     let Some(task) = sched.db.get(task_id)? else {
         return Ok(());
@@ -461,7 +462,33 @@ pub fn on_recycled(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::R
         "task_failed",
         serde_json::json!({"task_id": task_id, "to": task.to_ws, "reason": reason}),
     );
-    close_tab_only(sched, task_id)
+    close_tab_only(sched, task_id)?;
+    if sched.root_retry_max_attempts() == Some(0) {
+        let retry_id = uuid::Uuid::new_v4().to_string();
+        if sched
+            .db
+            .insert_task(
+                &retry_id,
+                &task.from_ws,
+                &task.to_ws,
+                &task.transfer_send_to,
+                task.attempt + 1,
+                &task.payload,
+            )
+            .unwrap_or(false)
+        {
+            sched.emit(
+                "task_retried",
+                serde_json::json!({
+                    "task_id": retry_id,
+                    "from_failed": task_id,
+                    "attempt": task.attempt + 1,
+                }),
+            );
+            let _ = dispatch_public(sched, &retry_id, &task.to_ws);
+        }
+    }
+    Ok(())
 }
 
 /// Remove the tracked tab and close it. The session has already accepted a

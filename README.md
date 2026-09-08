@@ -35,6 +35,10 @@ cargo build --release
 
 The package includes the Rust source, protocol documents, TUI document, and the `e2e/` stub runner.
 
+## Examples
+
+- [`examples/marquee`](examples/marquee/README.md): five-node relay ring (a→b→c→d→e→a) exercising reclaim, self-excitation, and unbounded whole-task replay.
+
 ## Create a swarm tree
 
 Run commands from the swarm root. The current directory becomes the scheduler root and stays local to that scheduler instance.
