@@ -139,6 +139,13 @@ async fn main() -> anyhow::Result<()> {
             let _db = db::Db::open(&root_p)?;
             let mut children = daemon::ensure_all(&root_p)?;
             println!("onlyne-swarm scheduler running at {}", root_p.display());
+            // R5.4: the scheduler is a foreground process sharing this pane's
+            // lifetime. Say so once: two rings have died to a stray Ctrl-C
+            // in a shared pane already. (--detach waits for the 0.7.0
+            // process-model redesign alongside the R4 state machine.)
+            println!(
+                "foreground scheduler in this pane; keep it exclusive — Ctrl-C here stops the ring"
+            );
             // serve() owns Ctrl-C/SIGTERM: it sets the Sched shutdown flag
             // (pump + reaper threads observe it and exit), then returns.
             // Only afterwards do we reap the managed daemons here.

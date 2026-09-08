@@ -100,6 +100,19 @@ stay on the root unless the operator enables them there.
 ONLYNE_BIN=/path/to/onlyne onlyne-swarm run
 ```
 
+Give the scheduler its own exclusive pane: it is a foreground process and
+Ctrl-C there stops the whole ring (`foreground scheduler in this pane;
+keep it exclusive`). Never run it in a pane shared with other sessions,
+and never probe a production root (e.g. a live flywheel) with shutdown or
+reconcile tests — use a scratch root or `SWARM_STUB_AGENT=1`.
+
+swarm-ready gates apply equally to root and every instance:
+`.onlyne/config.toml` has `[swarm] enabled = true`, `.pi/onlyne.json` has
+`watch.autoStart = true`, `.pi/settings.json` `packages` include pi-onlyne.
+Instances are backfilled by `run_sync`; root is operator-maintained —
+`status` `not_swarm_ready` reports which gate root is missing. A relay back
+to `_root` must pass root's gates too.
+
 Then from another shell in the same root:
 
 ```bash
