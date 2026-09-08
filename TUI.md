@@ -119,11 +119,11 @@ ratatui 实现的 swarm.sock 客户端（2s 全量轮询 + 事件驱动刷新）
 所以 `●/○` 全部显示离线。修订二要补该字段（`status` 或 `list_workspaces` 给出 daemon 活性），
 左栏的在线指示才有意义。
 
-### 3.3 orphan / dangling 缺口
+### 3.3 orphan / dangling 告警
 
-`status` 的 data 只有 `root/workspaces/tasks_by_state/ledger_tail`，`orphans` 与 `dangling`
-只在 `workspace create`（`sync.rs`）的返回值里算过。`tui.rs` 当前那段告警渲染是空转。
-修订二要二选一：`status` 补这两个字段，或删掉这段渲染并在文档记明告警来自 `sync` 输出。
+`status` 返回 `orphans` 与 `dangling`。它们由只读检查计算，复用 `sync` 的
+实例与 loopback 链接规则；左图栏底按红色告警行展示。`workspace sync` 的输出
+仍保留同一组告警，便于无 TUI 的排障。
 
 ### 3.4 `list_tasks` 扩参（修订二）
 
@@ -192,7 +192,7 @@ ratatui 实现的 swarm.sock 客户端（2s 全量轮询 + 事件驱动刷新）
 | `/` | 文本子串 | 输入态，Enter 应用，Esc 退出（payload / out_head / reason） |
 | `w` | 时间窗 | any → 1h → 24h → 7d |
 | `x` | 重试 | any → 只看 `attempt > 1` |
-| `PgUp/PgDn` | 翻页 | offset 按页移动，行数按栏高算 |
+| `PgUp/PgDn` | 翻页 | history 焦点下 offset 按页移动，graph 焦点下滚 detail 正文 |
 
 过滤串变化时 offset 归零。输入态中按 `Esc` 回到原过滤串。
 
@@ -221,7 +221,8 @@ ratatui 实现的 swarm.sock 客户端（2s 全量轮询 + 事件驱动刷新）
   3. 血缘：`parent <id8>` 与子节点 `id8` 列表（带 state 短词）
   4. `payload` 全文（按栏宽折行）
   5. `out_head` 与 `reason`（空值写 `(未写出)` / `(空)`）
-- 滚动：`J/K` 或 `PgUp/PgDn`，正文超栏高才移。选中行变化时滚动位置归零。
+- 滚动：`J/K` 始终滚正文。`PgUp/PgDn` 在 graph 焦点下也按页滚正文；history 焦点下
+  由同一按键负责 history 分页。选中行变化时滚动位置归零。
 - 数据源：`task_detail`（§3.5），按选中行拉，不进 2s 轮询。
 - 空态：无选中行时写 `(选中一个 session 看正文)`。detail 保持固定高度，画面会稳。
 - `status.ledger_tail` 在 TUI 的消耗方就此结束：状态计数由左栏框内 `+N` 担当，

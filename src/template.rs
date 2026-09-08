@@ -316,6 +316,14 @@ mod tests {
     }
 
     #[test]
+    fn marquee_declares_e_to_a_return_edge() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/marquee");
+        let tree = load_tree(&root).unwrap();
+        let e = tree.iter().find(|entry| entry.path == "e").unwrap();
+        assert_eq!(e.back_edges, vec!["a"]);
+    }
+
+    #[test]
     fn missing_edge_target_fails() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();

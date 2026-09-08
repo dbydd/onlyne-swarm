@@ -29,7 +29,7 @@ swarm() { "$SWARM_BIN" "$@"; }
 task_state() { # task_state <id8> -> state string
   (cd "$E2E_ROOT" && swarm list 2>/dev/null | python3 -c "
 import json,sys
-for t in json.load(sys.stdin)['data']:
+for t in json.load(sys.stdin)['data']['rows']:
     if t['task_id'].startswith('$1'):
         print(t['state']); break
 ")
@@ -136,13 +136,13 @@ e2e2() { # e2e2 <gap> <name>
   # Poll until all three tasks reach a terminal state.
   local end=$((SECONDS + 120))
   while ((SECONDS < end)); do
-    local done; done=$(cd "$E2E_ROOT" && swarm list --state done 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
-    local closed; closed=$(cd "$E2E_ROOT" && swarm list --state closed 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
+    local done; done=$(cd "$E2E_ROOT" && swarm list --state done 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']['rows']))")
+    local closed; closed=$(cd "$E2E_ROOT" && swarm list --state closed 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']['rows']))")
     ((done + closed >= 3)) && break
     sleep 2
   done
-  local done; done=$(cd "$E2E_ROOT" && swarm list --state done 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
-  local closed; closed=$(cd "$E2E_ROOT" && swarm list --state closed 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
+  local done; done=$(cd "$E2E_ROOT" && swarm list --state done 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']['rows']))")
+  local closed; closed=$(cd "$E2E_ROOT" && swarm list --state closed 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']['rows']))")
   ((done + closed >= 3)) || die "E2E-2 expected parent+2 children terminal (done=$done closed=$closed)"
   log "E2E-2 ($2) PASS"
 }
@@ -167,7 +167,7 @@ PY
   # it via out; the parked handle must not steal the delivery.
   python3 "$REPO/stub_parked_ready.py" "$(wsdir b)" b "parked-$MARK" &
   sleep 45
-  local before; before=$(cd "$E2E_ROOT" && swarm list 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
+  local before; before=$(cd "$E2E_ROOT" && swarm list 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']['rows']))")
   ((before >= 5)) || die "E2E-3 loop did not self-excite (tasks=$before)"
   log "loop alive with $before tasks; cancelling the seed family"
   # Fire-and-forget hops close fast; there may be no Running row at this
@@ -181,13 +181,13 @@ PY
   for _ in $(seq 1 10); do
     live=$(cd "$E2E_ROOT" && swarm list --state running 2>/dev/null | python3 -c "
 import json,sys
-ds = json.load(sys.stdin)['data']
+ds = json.load(sys.stdin)['data']['rows']
 print(ds[0]['task_id'] if ds else '')")
     [[ -n "$live" ]] || break
     (cd "$E2E_ROOT" && swarm cancel "$live" --reason "e2e-3 quiesce" >/dev/null)
     sleep 2
   done
-  local running; running=$(cd "$E2E_ROOT" && swarm list --state running 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
+  local running; running=$(cd "$E2E_ROOT" && swarm list --state running 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']['rows']))")
   [[ "$running" == "0" ]] || die "E2E-3 $running tasks still running after cancel+stubkill"
   log "E2E-3 PASS"
 }

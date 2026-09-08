@@ -26,7 +26,7 @@ fn ping(sock: &Path) -> bool {
     {
         return false;
     }
-    s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    s.set_read_timeout(Some(Duration::from_millis(150))).ok();
     let mut r = BufReader::new(&s);
     let mut line = String::new();
     r.read_line(&mut line).is_ok() && line.contains("\"ok\":true")

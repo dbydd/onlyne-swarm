@@ -726,40 +726,33 @@ mod sched_tests {
     }
 
     #[test]
-    fn tree_groups_hops_under_their_workspace_and_marks_focusable_tab() {
+    fn role_graph_groups_hops_and_marks_focusable_tab() {
         let workspaces = vec![
-            serde_json::json!({"path": "."}),
-            serde_json::json!({"path": "model"}),
+            serde_json::json!({"path": ".", "name": "root", "daemon": "ready", "back_edges": []}),
+            serde_json::json!({"path": "model", "name": "model", "daemon": "ready", "back_edges": []}),
         ];
         let tasks = vec![
             serde_json::json!({"task_id": "root-task-abcdefgh", "to_ws": ".", "state": "running", "terminal": "term_root"}),
             serde_json::json!({"task_id": "model-task-abcdefgh", "to_ws": "model", "state": "running", "terminal": "term_model"}),
-            serde_json::json!({"task_id": "old-model-abcdefgh", "to_ws": "model", "state": "closed", "terminal": ""}),
         ];
-        let lines = crate::tui::tree_tab_lines(&workspaces, &tasks, 1);
-        assert_eq!(lines.len(), 3);
-        assert!(lines[0].contains("root-tas") && lines[0].contains("◉"));
-        assert!(lines[1].starts_with("▶ model-ta") && lines[1].contains("◉"));
-        assert!(lines[2].starts_with("· old-mode") && !lines[2].contains("◉"));
+        let graph = serde_json::json!({"by_ws": [], "edges": []});
+        let layout = crate::tui::build_graph_layout(&workspaces, &tasks, &graph, 52, 20, Some("model-task-abcdefgh"), &[]);
+        let text = layout.lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("root ●") && text.contains("model ●"));
+        assert!(text.contains("root-ta") && text.contains("model-ta"));
+        assert!(text.contains("◉"));
+        assert!(layout.lines.iter().any(|line| line.kind == crate::tui::GraphLineKind::Selected));
     }
 
     #[test]
-    fn render_snapshot_shapes() {
-        let tasks = vec![
-            serde_json::json!({"task_id": "abcdefgh-1234", "from_ws": ".", "to_ws": "a",
-                               "attempt": 1, "state": "running", "transfer_send_to": ""}),
-            serde_json::json!({"task_id": "x", "from_ws": "a", "to_ws": "b",
-                               "attempt": 3, "state": "failed", "transfer_send_to": "p"}),
-        ];
-        let snap = crate::tui::snapshot_for_test(
-            serde_json::Value::Null,
-            vec![],
-            tasks.clone(),
-        );
-        assert_eq!(snap.task_count_for_test(), 2);
-        let rows = crate::tui::task_rows_for_test(&snap.tasks_for_test(), 0);
-        assert_eq!(rows.len(), 2);
-        // Failed row keeps its state string for the red style branch.
-        assert!(rows[1].contains("failed"));
+    fn detail_snapshot_shapes() {
+        let detail = serde_json::json!({
+            "task": {"task_id":"abcdefgh-1234", "from_ws":".", "to_ws":"a", "attempt":1, "state":"running", "terminal":"", "created_at":0, "payload":"body", "out_head":"", "reason":""},
+            "parent": null,
+            "children": []
+        });
+        let (title, body) = crate::tui::detail_text(&detail);
+        assert!(title.contains("abcdefgh"));
+        assert!(body.contains("body"));
     }
 }
