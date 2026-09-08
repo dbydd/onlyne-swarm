@@ -16,7 +16,7 @@ TUI 历史查询都依赖它们）。新增的是 hop 运行态子状态，存 `
 
 | hop_state | 进入条件 | 退出条件 | 超时 | 超时动作 |
 |---|---|---|---|---|
-| `dispatched` | `dispatch()` 建好 pane（或复用 idle pane）并写库 | 收到 `swarm_ready` 且 handle 匹配 | 120s，可配（见下） | `swarm_ready timeout` failed + ledger，和今天一样；`running_since` 为空的行才判（R5 已修对的守卫，原样保留） |
+| `dispatched` | `dispatch()` 新建 pane 并写库（复用 idle pane 直进 `busy`，见 §3） | 收到 `swarm_ready` 且 handle 匹配 | 120s，可配（见下） | `swarm_ready timeout` failed + ledger，和今天一样；`running_since` 为空的行才判（R5 已修对的守卫，原样保留） |
 | `ready` | `on_ready` 匹配上 task，但 `write_loopback_in` 尚未成功 | 正文写出成功 | 30s，全局固定 | 同上 failed 路径，reason `delivery timeout`；写出是本地 FIFO 操作，30s 写不出说明 daemon 已死，不必可配 |
 | `busy` | `write_loopback_in` 成功（今天 `running_since` 插入点）；收养（R5）直接进 `busy`（CR2，探活即干活证据，后续 idle/busy 自然纠正） | 收到 `swarm_busy`/`swarm_idle`/`out`/recycle | 按 role 配长跑上限（见下），默认无上限 | 超限只 emit `hop_overlong` + TUI 标红，不杀会话（杀的权力留给人 `cancel`；swarm 层不猜长跑是死是活） |
 | `idle` | 收到 `swarm_idle`（turn 结束且本轮无 out） | 收到 `swarm_busy`（新 turn 开始）或 `out` 或 recycle | 空闲 TTL，默认 60s，复用今天 idle 池的 TTL（§4） | TTL 到期判 hop 停滞：`swarm_idle timeout` failed + ledger + 回收 pane。注意这不是今天的静默池过期（今天过期只丢 handle 不记账）；改名义：过期 = 失败事件 |
@@ -70,7 +70,8 @@ daemon 已死的现场调成更长的静默。
   且 body 带 `"pending_exit": true`。scheduler 记 idle，只 emit
   `hop_state` 与 TUI 显示，不发第二份提醒、不判失败。提醒的唯一
   actor 仍是插件本地 `scheduleSwarmExitReminder`（不动；CR3：两代
-  插件混跑时 scheduler 再发一份就会把同一会话 nag 两次）。- 已交活待回收（out 已写，等 recycle ack 关 tab）：不发 idle。out
+  插件混跑时 scheduler 再发一份就会把同一会话 nag 两次）。
+- 已交活待回收（out 已写，等 recycle ack 关 tab）：不发 idle。out
   落库即终态，回收窗口的 5s `wait_recycled_ack` 覆盖它；这段空闲不进
   状态机。
 - 区分位由插件填：发 idle 时查 `state.swarmTask` 是否还存在。存在 =
