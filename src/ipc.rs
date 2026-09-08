@@ -248,34 +248,62 @@ fn handle_conn(sched: Arc<Sched>, stream: UnixStream) -> anyhow::Result<()> {
             "status" => {
                 let counts = sched.db.counts().unwrap_or_default();
                 let tree = crate::template::load_tree(&sched.root).unwrap_or_default();
+                let health = crate::sync::inspect(&sched.root).unwrap_or_default();
                 let data = serde_json::json!({
                     "root": sched.root.to_string_lossy(),
                     "workspaces": tree.len(),
                     "tasks_by_state": counts,
                     "ledger_tail": sched.db.ledger(20).unwrap_or_default(),
+                    "orphans": health.orphans,
+                    "dangling": health.dangling,
                 });
                 write_resp(&mut writer, &id, true, Some(data), None)?;
             }
+            "graph" => match sched.db.graph() {
+                Ok(graph) => write_resp(&mut writer, &id, true, Some(serde_json::json!(graph)), None)?,
+                Err(e) => write_resp(&mut writer, &id, false, None, Some(e.to_string()))?,
+            },
             "list_workspaces" => {
                 let tree = crate::template::load_tree(&sched.root).unwrap_or_default();
                 let items: Vec<_> = tree
                     .iter()
                     .map(|e| {
+                        let path = if e.path.is_empty() { "." } else { &e.path };
+                        let ws = crate::root::resolve_instance(&sched.root, &e.path);
+                        let daemon = if crate::daemon::is_alive(&crate::root::onlyne_sock(&ws)) {
+                            "ready"
+                        } else {
+                            "offline"
+                        };
                         serde_json::json!({
-                            "path": if e.path.is_empty() { "." } else { &e.path },
+                            "path": path,
                             "name": e.name,
                             "model": {"provider": e.model.provider, "model": e.model.model, "effort": e.model.effort},
                             "back_edges": e.back_edges,
+                            "daemon": daemon,
                         })
                     })
                     .collect();
                 write_resp(&mut writer, &id, true, Some(serde_json::json!(items)), None)?;
             }
             "list_tasks" => {
-                let state = req.get("state").and_then(|s| s.as_str());
-                let limit = req.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
-                match sched.db.list(state, limit) {
-                    Ok(rows) => write_resp(&mut writer, &id, true, Some(serde_json::json!(rows)), None)?,
+                let filter = task_filter(&req);
+                match sched.db.list_page(&filter) {
+                    Ok(page) => write_resp(&mut writer, &id, true, Some(serde_json::json!(page)), None)?,
+                    Err(e) => write_resp(&mut writer, &id, false, None, Some(e.to_string()))?,
+                }
+            }
+            "task_detail" => {
+                let task_id = req.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+                match sched.db.detail(task_id) {
+                    Ok(Some(detail)) => write_resp(&mut writer, &id, true, Some(serde_json::json!(detail)), None)?,
+                    Ok(None) => write_resp(
+                        &mut writer,
+                        &id,
+                        false,
+                        None,
+                        Some(format!("unknown task: {task_id}")),
+                    )?,
                     Err(e) => write_resp(&mut writer, &id, false, None, Some(e.to_string()))?,
                 }
             }
@@ -326,6 +354,19 @@ fn handle_conn(sched: Arc<Sched>, stream: UnixStream) -> anyhow::Result<()> {
             }
             _ => write_resp(&mut writer, &id, false, None, Some(format!("unknown op: {op}")))?,
         }
+    }
+}
+
+fn task_filter(req: &serde_json::Value) -> crate::db::TaskFilter {
+    crate::db::TaskFilter {
+        state: req.get("state").and_then(|v| v.as_str()).map(str::to_owned),
+        to_ws: req.get("to_ws").and_then(|v| v.as_str()).map(str::to_owned),
+        from_ws: req.get("from_ws").and_then(|v| v.as_str()).map(str::to_owned),
+        text: req.get("text").and_then(|v| v.as_str()).map(str::to_owned),
+        since: req.get("since").and_then(|v| v.as_i64()),
+        retry_only: req.get("retry_only").and_then(|v| v.as_bool()).unwrap_or(false),
+        limit: req.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize,
+        offset: req.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
     }
 }
 
@@ -392,6 +433,28 @@ mod tests {
         let _ = Box::leak(Box::new(dir));
         let db = Db::open(root).unwrap();
         Sched::new(root.to_path_buf(), db)
+    }
+
+    #[test]
+    fn task_filter_maps_all_history_predicates() {
+        let filter = task_filter(&serde_json::json!({
+            "state": "active",
+            "to_ws": "scout",
+            "from_ws": "model",
+            "text": "needle",
+            "since": 123,
+            "retry_only": true,
+            "limit": 42,
+            "offset": 84,
+        }));
+        assert_eq!(filter.state.as_deref(), Some("active"));
+        assert_eq!(filter.to_ws.as_deref(), Some("scout"));
+        assert_eq!(filter.from_ws.as_deref(), Some("model"));
+        assert_eq!(filter.text.as_deref(), Some("needle"));
+        assert_eq!(filter.since, Some(123));
+        assert!(filter.retry_only);
+        assert_eq!(filter.limit, 42);
+        assert_eq!(filter.offset, 84);
     }
 
     #[test]

@@ -32,6 +32,11 @@ fn ping(sock: &Path) -> bool {
     r.read_line(&mut line).is_ok() && line.contains("\"ok\":true")
 }
 
+/// Probe a workspace daemon without taking ownership of its lifecycle.
+pub fn is_alive(sock: &Path) -> bool {
+    ping(sock)
+}
+
 /// Ensure a daemon per workspace. Reuses already-running daemons (ping check);
 /// spawns `onlyne --workspace <dir> run` otherwise. Returns managed children
 /// (only the ones we spawned, for shutdown).

@@ -95,20 +95,67 @@ pub fn run_sync(root: &Path) -> anyhow::Result<SyncReport> {
     }
 
     // Orphans: existing instance dirs with no description.
-    let inst = crate::root::instances_dir(root);
-    if inst.is_dir() {
-        let mut found: Vec<String> = vec![];
-        collect_rel(&inst, &inst, &mut found)?;
-        for f in found {
-            if !known.contains(f.as_str()) {
-                report.orphans.push(f);
-            }
-        }
-    }
+    collect_orphans(root, &known, &mut report)?;
 
     refresh_links(root, &tree, &mut report)?;
     register_hierarchy(root, &tree, &mut report);
     Ok(report)
+}
+
+/// Inspect generated-workspace health without writing configs or refreshing
+/// symlinks. `status` uses this so the TUI can render orphan/dangling alerts.
+pub fn inspect(root: &Path) -> anyhow::Result<SyncReport> {
+    let tree = crate::template::load_tree(root)?;
+    let mut report = SyncReport {
+        workspaces: tree.len(),
+        ..Default::default()
+    };
+    let known: BTreeSet<&str> = tree.iter().map(|e| e.path.as_str()).collect();
+    collect_orphans(root, &known, &mut report)?;
+    inspect_links(root, &tree, &mut report);
+    Ok(report)
+}
+
+fn collect_orphans(
+    root: &Path,
+    known: &BTreeSet<&str>,
+    report: &mut SyncReport,
+) -> anyhow::Result<()> {
+    let inst = crate::root::instances_dir(root);
+    if !inst.is_dir() {
+        return Ok(());
+    }
+    let mut found = vec![];
+    collect_rel(&inst, &inst, &mut found)?;
+    for f in found {
+        if !known.contains(f.as_str()) {
+            report.orphans.push(f);
+        }
+    }
+    Ok(())
+}
+
+fn inspect_links(root: &Path, tree: &[Effective], report: &mut SyncReport) {
+    let targets: Vec<&str> = tree.iter().map(|e| e.path.as_str()).collect();
+    for e in tree {
+        let ws = crate::root::resolve_instance(root, &e.path);
+        let view = ws.join("onlyne_in");
+        for target in &targets {
+            if *target == e.path {
+                continue;
+            }
+            let target_name = if target.is_empty() { "_root" } else { target };
+            let link = view.join(target_name);
+            let target_in = crate::root::loopback_in(&crate::root::resolve_instance(root, target));
+            if std::fs::symlink_metadata(&link).is_err() || std::fs::metadata(&target_in).is_err() {
+                report.dangling.push(format!(
+                    "{}: onlyne_in/{}",
+                    display_path(&e.path),
+                    target_name
+                ));
+            }
+        }
+    }
 }
 
 /// Best-effort Orca node cleanup per workspace. Folder-kind nodes are Orca-side
