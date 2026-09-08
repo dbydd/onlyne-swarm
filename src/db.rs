@@ -27,7 +27,7 @@ pub enum TaskState {
 }
 
 impl TaskState {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             TaskState::Pending => "pending",
             TaskState::Running => "running",
@@ -360,7 +360,7 @@ impl Db {
         let c = self.inner.lock().unwrap();
         let mut st = c.prepare(
             "SELECT task_id, transfer_send_to, from_ws, to_ws, ledger_state, out_head, reason FROM tasks
-             WHERE ledger_state IN ('done','failed','cancelled','spawn_failed') ORDER BY created_at DESC LIMIT ?",
+             WHERE ledger_state IN ('done','failed','cancelled','spawn_failed','adopted') ORDER BY created_at DESC LIMIT ?",
         )?;
         let mut out = vec![];
         for r in st.query_map(params![limit as i64], |r| {

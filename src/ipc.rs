@@ -99,9 +99,41 @@ fn reap_previous_run(sched: &Arc<Sched>) {
         return;
     };
     for r in rows {
-        if r.state == crate::db::TaskState::Running || r.state == crate::db::TaskState::Pending {
-            let _ = sched::on_early_exit(sched, &r.task_id, "scheduler restarted");
+        if r.state != crate::db::TaskState::Running && r.state != crate::db::TaskState::Pending {
+            continue;
         }
+        // R5: adopt-before-kill. The scheduler is a foreground process and
+        // `stop_all` only reaches daemons it spawned; worker pi sessions
+        // routinely survive a restart (their daemon lives under the session).
+        // Only declare the task dead when its terminal is provably gone —
+        // otherwise re-adopt the handle so a later out is still recorded.
+        // A dropped out on a terminal row is now also emitted (R5.3).
+        if !r.terminal.is_empty()
+            && !r.terminal.starts_with("stub-")
+            && crate::orca_term::is_alive(&r.terminal)
+        {
+            sched.terminals.lock().unwrap().insert(r.task_id.clone(), r.terminal.clone());
+            sched.running_since.lock().unwrap().insert(r.task_id.clone(), std::time::Instant::now());
+            sched.db.set_ledger(&r.task_id, "adopted", "", "scheduler restarted; live session re-adopted").ok();
+            crate::db::append_ledger_line(
+                &sched.root,
+                &crate::db::LedgerEvent {
+                    task_id: r.task_id.clone(),
+                    transfer_send_to: r.transfer_send_to.clone(),
+                    from_ws: r.from_ws.clone(),
+                    to_ws: r.to_ws.clone(),
+                    state: "adopted".into(),
+                    out_head: String::new(),
+                    reason: "scheduler restarted; live session re-adopted".into(),
+                },
+            );
+            sched.emit(
+                "task_adopted",
+                serde_json::json!({"task_id": r.task_id, "to": r.to_ws, "terminal_handle": r.terminal}),
+            );
+            continue;
+        }
+        let _ = sched::on_early_exit(sched, &r.task_id, "scheduler restarted");
     }
 }
 
@@ -588,6 +620,31 @@ mod tests {
         let (failed, retried) = sweep_dead_terminals(&s);
         assert!(failed.is_empty());
         assert!(retried.is_empty());
+        std::env::remove_var("ORCA_CLI_COMMAND");
+    }
+
+    #[test]
+    fn restart_reconcile_adopts_live_terminal() {
+        // R5: a running row whose orca tab is still alive must be adopted,
+        // not failed. The liveness contract treats probe failure as alive
+        // (unknown), so /bin/false as the orca binary exercises adoption.
+        std::env::set_var("ORCA_CLI_COMMAND", "/bin/false");
+        let s = test_sched();
+        s.db.insert_task("adopt1", ".", "a", "", 1, "p").unwrap();
+        s.db.set_state("adopt1", TaskState::Running).unwrap();
+        s.db.set_terminal("adopt1", "term-live").unwrap();
+        super::reap_previous_run(&s);
+        let row = s.db.get("adopt1").unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Running);
+        assert!(s.terminals.lock().unwrap().contains_key("adopt1"));
+        let tail = s.db.ledger(10).unwrap();
+        assert!(tail.iter().any(|e| e.task_id == "adopt1" && e.state == "adopted"));
+        // A row with no terminal at all still fails fast.
+        s.db.insert_task("dead1", ".", "a", "", 1, "p").unwrap();
+        s.db.set_state("dead1", TaskState::Running).unwrap();
+        super::reap_previous_run(&s);
+        let row = s.db.get("dead1").unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Failed);
         std::env::remove_var("ORCA_CLI_COMMAND");
     }
 }

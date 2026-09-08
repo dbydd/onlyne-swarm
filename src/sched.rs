@@ -318,11 +318,22 @@ pub fn on_out(
         return Ok(()); // Unknown task: ignore.
     };
     // Idempotent redelivery: an already-terminal task never re-records.
+    // R5.3: emit instead of silently dropping — a dropped out means a live
+    // session's handoff evaporated (e.g. restart reconcile raced the out).
+    // The emit makes the loss visible in TUI/subscribe streams; without it
+    // the接力 stalls at the hop boundary with no trace.
     match task.state {
         crate::db::TaskState::Done
         | crate::db::TaskState::Failed
         | crate::db::TaskState::Cancelled
-        | crate::db::TaskState::Closed => return Ok(()),
+        | crate::db::TaskState::Closed => {
+            sched.emit(
+                "out_for_terminal_task_dropped",
+                serde_json::json!({"task_id": task_id, "from": from_ws, "state": task.state.as_str()}),
+            );
+            tracing::warn!(task = %task_id, from = %from_ws, state = %task.state.as_str(), "out_for_terminal_task_dropped");
+            return Ok(());
+        }
         _ => {}
     }
     sched.db.set_state(task_id, crate::db::TaskState::Done)?;
