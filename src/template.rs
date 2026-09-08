@@ -225,6 +225,14 @@ fn collect_dirs(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     for e in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
         let e = e?;
         if e.file_type()?.is_dir() {
+            // Dot-dirs (`.pi/`, `.git/`, `.DS_Store/` etc.) are tooling
+            // metadata, never workspace layers. Without this a per-role
+            // `.pi/settings.json` materializes a phantom `<role>/.pi`
+            // instance and `refresh_links` dies on EEXIST(17) against the
+            // `onlyne_in/<role>` symlink file (observed 2026-09-08).
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
             out.push(e.path());
             collect_dirs(&e.path(), out)?;
         }
@@ -321,6 +329,28 @@ mod tests {
         let tree = load_tree(&root).unwrap();
         let e = tree.iter().find(|entry| entry.path == "e").unwrap();
         assert_eq!(e.back_edges, vec!["a"]);
+    }
+
+    #[test]
+    fn dot_dirs_are_not_workspace_layers() {
+        // regression (2026-09-08): a per-role `.pi/settings.json` made
+        // collect_dirs treat `.pi` as a `<role>/.pi` workspace; run_sync
+        // then materialized phantom instances and refresh_links died on
+        // EEXIST(17) against the `onlyne_in/<role>` symlink file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".agents/.schedule/a/.pi")).unwrap();
+        std::fs::write(
+            root.join(".agents/.schedule/a/template.workspace.jsonc"),
+            r#"{"name": "a", "role": "r"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join(".agents/.schedule/a/.pi/settings.json"), "{}").unwrap();
+        let tree = load_tree(root).unwrap();
+        assert!(tree.iter().all(|e| e.path != "a/.pi"), "got {:?}", tree.iter().map(|e| &e.path).collect::<Vec<_>>());
+        let rep = crate::sync::run_sync(root).unwrap();
+        assert!(!rep.created.iter().any(|c| c == "a/.pi"));
+        assert!(!root.join(".ws/a/.pi/.onlyne").exists());
     }
 
     #[test]

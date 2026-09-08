@@ -65,14 +65,14 @@ pub async fn serve(root: &Path) -> anyhow::Result<()> {
     // flag (accept has no timeout). Poll it with a 100ms timeout so
     // Ctrl-C breaks the loop promptly after the flag is set.
     listener.set_nonblocking(true)?;
-    loop {
+    let serve_result = loop {
         // Bridge the signal-hook flag into the Sched flag the pump/reaper
         // threads observe.
         if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
             sched.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         if sched.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
+            break Ok(());
         }
         match listener.accept() {
             Ok((stream, _)) => {
@@ -84,10 +84,14 @@ pub async fn serve(root: &Path) -> anyhow::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => break Err::<(), _>(e.into()),
         }
-    }
-    Ok(())
+    };
+    // Graceful exit leaves no stale socket: without this `status` in the
+    // stopped window reports ECONNREFUSED instead of "no scheduler".
+    // Next start's stale-takeover still exists as a crash backstop.
+    let _ = std::fs::remove_file(crate::root::swarm_sock(root));
+    serve_result
 }
 
 fn reap_previous_run(sched: &Arc<Sched>) {
