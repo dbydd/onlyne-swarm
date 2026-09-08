@@ -67,6 +67,19 @@ impl Sched {
             data,
         });
     }
+
+    /// Root retry budget for the dead-terminal sweep, read from the root
+    /// `.onlyne/swarm.workspace.jsonc` (`"retry": {"max_attempts": N}`).
+    /// `Some(0)` means unbounded full-task replay; `None` keeps the default
+    /// compiled cap. Malformed config falls back to `None` by design.
+    pub fn root_retry_max_attempts(&self) -> Option<u32> {
+        let raw = std::fs::read_to_string(crate::root::swarm_ws_config(&self.root)).ok()?;
+        let v: serde_json::Value = crate::template::parse_lenient(&raw).ok()?;
+        v.get("retry")
+            .and_then(|r| r.get("max_attempts"))
+            .and_then(|m| m.as_u64())
+            .map(|m| m.min(u32::MAX as u64) as u32)
+    }
 }
 
 /// Submit a payload to a workspace: allocate task_id, persist, and queue for dispatch.

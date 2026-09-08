@@ -14,6 +14,12 @@ pub struct Model {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkspaceTemplate {
     #[serde(default)]
     pub name: String,
@@ -23,6 +29,8 @@ pub struct WorkspaceTemplate {
     pub model: Model,
     #[serde(default)]
     pub back_edges: Vec<String>,
+    #[serde(default)]
+    pub retry: Option<RetryPolicy>,
 }
 
 /// Effective (merged) description of one workspace, keyed by tree path ("" = root).
@@ -39,6 +47,13 @@ pub struct Effective {
 fn parse_jsonc(path: &Path) -> anyhow::Result<WorkspaceTemplate> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     json5::from_str(&text).with_context(|| format!("parse {}", path.display()))
+}
+
+/// Parse a JSONC template document held in memory (root config overlays).
+/// Same parser as the file path, so comment style stays identical.
+pub fn parse_lenient(text: &str) -> anyhow::Result<serde_json::Value> {
+    let v: serde_json::Value = json5::from_str(text)?;
+    Ok(v)
 }
 
 fn load_opt(path: &Path) -> anyhow::Result<Option<WorkspaceTemplate>> {

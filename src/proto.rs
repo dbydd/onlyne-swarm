@@ -84,8 +84,14 @@ pub fn render(header: &SwarmHeader, role: &str, payload_markdown: &str) -> Strin
     s.push_str(&format!("transfer_send_to: {}\n", header.transfer_send_to));
     s.push_str(&format!("attempt: {}\n", header.attempt));
     s.push_str("---\n");
+    // Flat role block: plain numbered steps, no duplicate echo (the old
+    // `## role:` header + full echo confused claim parsing on cold start).
     if !role.is_empty() {
-        s.push_str(&format!("## role: {}\n\n{}\n", role, role));
+        s.push_str(role);
+        if !role.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push('\n');
     }
     s.push_str(payload_markdown);
     if !payload_markdown.ends_with('\n') {

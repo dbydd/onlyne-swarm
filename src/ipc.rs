@@ -58,8 +58,14 @@ fn reap_previous_run(sched: &Arc<Sched>) {
 
 /// One dead-terminal sweep iteration, extracted for unit testing.
 /// Returns (failed_task_ids, retried_task_ids).
+///
+/// Retry policy is root-configurable: `.onlyne/swarm.workspace.jsonc` may set
+/// `"retry": {"max_attempts": 0}` for rings the operator wants retried
+/// without a cap (max_attempts 0 = unbounded, each failure replays the task
+/// unchanged with attempt+1). Absent config keeps MAX_ATTEMPTS = 3.
 fn sweep_dead_terminals(sched: &Arc<Sched>) -> (Vec<String>, Vec<String>) {
     const MAX_ATTEMPTS: u32 = 3;
+    let max_attempts: Option<u32> = sched.root_retry_max_attempts();
     let mut failed = vec![];
     let mut retried = vec![];
     // Dead-terminal sweep: a Running task whose orca tab is gone (pi
@@ -92,7 +98,7 @@ fn sweep_dead_terminals(sched: &Arc<Sched>) -> (Vec<String>, Vec<String>) {
         // Terminal dead, no out: failed + ledger, then retry or drop.
         let _ = sched::on_early_exit(sched, &task_id, "terminal exited before out");
         failed.push(task_id.clone());
-        if attempt < MAX_ATTEMPTS {
+        if max_attempts.map(|m| attempt < m).unwrap_or(attempt < MAX_ATTEMPTS) {
             if let Ok(Some(task)) = sched.db.get(&task_id) {
                 let retry_id = uuid::Uuid::new_v4().to_string();
                 if sched
@@ -121,7 +127,7 @@ fn sweep_dead_terminals(sched: &Arc<Sched>) -> (Vec<String>, Vec<String>) {
                 }
             }
         } else {
-            tracing::warn!(task = %task_id, attempt, "terminal dead, attempt cap reached; not retrying");
+            tracing::warn!(task = %task_id, attempt, max_attempts = ?max_attempts, "terminal dead, attempt cap reached; not retrying");
         }
     }
     (failed, retried)
@@ -167,6 +173,38 @@ fn reap_loop(sched: Arc<Sched>) {
                     "task_stalled_ready_timeout",
                     serde_json::json!({"task_id": task_id}),
                 );
+                // Marquee policy: an unbounded root retry budget replays a
+                // ready-timeout stall as a fresh terminal instead of parking
+                // the ring. Bounded roots keep the old fail-stop behavior.
+                if sched.root_retry_max_attempts() == Some(0) {
+                    if let Ok(Some(task)) = sched.db.get(&task_id) {
+                        let retry_id = uuid::Uuid::new_v4().to_string();
+                        let _ = sched::on_early_exit(&sched, &task_id, "swarm_ready timeout");
+                        if sched
+                            .db
+                            .insert_task(
+                                &retry_id,
+                                &task.from_ws,
+                                &task.to_ws,
+                                &task.transfer_send_to,
+                                task.attempt + 1,
+                                &task.payload,
+                            )
+                            .unwrap_or(false)
+                        {
+                            sched.emit(
+                                "task_retried",
+                                serde_json::json!({
+                                    "task_id": retry_id,
+                                    "from_failed": task_id,
+                                    "attempt": task.attempt + 1,
+                                }),
+                            );
+                            let _ = sched::dispatch_public(&sched, &retry_id, &task.to_ws);
+                        }
+                    }
+                    continue;
+                }
                 let _ = sched::on_early_exit(&sched, &task_id, "swarm_ready timeout");
             }
         }
