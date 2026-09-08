@@ -139,14 +139,12 @@ async fn main() -> anyhow::Result<()> {
             let _db = db::Db::open(&root_p)?;
             let mut children = daemon::ensure_all(&root_p)?;
             println!("onlyne-swarm scheduler running at {}", root_p.display());
-            let serve = ipc::serve(&root_p);
-            tokio::select! {
-                r = serve => r?,
-                _ = tokio::signal::ctrl_c() => {
-                    println!("shutting down; stopping managed daemons");
-                    daemon::stop_all(&mut children).await;
-                }
-            }
+            // serve() owns Ctrl-C/SIGTERM: it sets the Sched shutdown flag
+            // (pump + reaper threads observe it and exit), then returns.
+            // Only afterwards do we reap the managed daemons here.
+            ipc::serve(&root_p).await?;
+            println!("shutting down; stopping managed daemons");
+            daemon::stop_all(&mut children).await;
             Ok(())
         }
         Cmd::Attach | Cmd::Status => {

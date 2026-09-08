@@ -7,6 +7,9 @@ use crate::sched::{self, Sched};
 /// Subscribe to every workspace daemon's `run/s` at top priority and
 /// route swarm traffic. Runs on a plain thread (blocking sockets), one
 /// connection per workspace daemon, with reconnect on drop.
+///
+/// Shutdown: `serve()` closes the socket pair on Ctrl-C; `watch_once`
+/// returns Err on EOF so `watch_workspace` exits instead of reconnecting.
 pub fn pump(sched: Arc<Sched>) {
     let tree = crate::template::load_tree(&sched.root).unwrap_or_default();
     for e in tree {
@@ -18,10 +21,22 @@ pub fn pump(sched: Arc<Sched>) {
 
 fn watch_workspace(sched: Arc<Sched>, ws_path: String) {
     loop {
+        // Shutdown gate: stop reconnecting once the scheduler is gone.
+        // `serve()` closes the socket pair on Ctrl-C; without this the pump
+        // threads spin forever and the process never exits.
+        if sched.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let ws = crate::root::resolve_instance(&sched.root, &ws_path);
         let sock = crate::root::onlyne_sock(&ws);
         if let Err(e) = watch_once(&sched, &ws_path, &sock) {
-            tracing::warn!(workspace = %ws_path, error = %e, "daemon watch dropped; reconnecting");
+            if sched.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            // Daemon not up yet (or shutting down): back off quietly.
+            // The daemon is spawned by ensure_all before serve(); a missing
+            // socket here means startup ordering, not a crash worth warning.
+            tracing::debug!(workspace = %ws_path, error = %e, "daemon watch dropped; reconnecting");
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }

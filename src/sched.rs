@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
 use tokio::sync::broadcast;
 
 /// Scheduler events fanned out to swarm.sock `subscribe` clients and the TUI.
@@ -31,6 +32,8 @@ pub struct Sched {
     pub root: PathBuf,
     pub db: crate::db::Db,
     pub bus: Arc<Bus>,
+    /// Set on shutdown so pump/reaper threads stop reconnecting and exit.
+    pub shutdown: Arc<AtomicBool>,
     /// task_id -> terminal handle for running tasks.
     pub terminals: Mutex<HashMap<String, String>>,
     /// workspace path -> idle ready terminal handles (transient pool).
@@ -54,6 +57,7 @@ impl Sched {
             root,
             db,
             bus: Arc::new(Bus::default()),
+            shutdown: Arc::new(AtomicBool::new(false)),
             terminals: Mutex::new(HashMap::new()),
             idle: Mutex::new(HashMap::new()),
             awaiting_ready: Mutex::new(HashMap::new()),

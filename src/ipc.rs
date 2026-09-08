@@ -7,6 +7,10 @@ use crate::sched::{self, Sched};
 
 /// Serve swarm.sock: line-delimited JSON requests, one-line responses.
 /// `subscribe` upgrades the connection to an event stream.
+///
+/// Shutdown contract: Ctrl-C sets `sched.shutdown` (pump/reaper threads
+/// observe it and exit), stops managed daemons, then returns. The
+/// listener is dropped here so no new connections arrive during teardown.
 pub async fn serve(root: &Path) -> anyhow::Result<()> {
     let sock = crate::root::swarm_sock(root);
     if sock.exists() {
@@ -22,6 +26,27 @@ pub async fn serve(root: &Path) -> anyhow::Result<()> {
         root.to_path_buf(),
         crate::db::Db::open(root)?,
     );
+    // Ctrl-C / SIGTERM path: set the shutdown flag so pump watch threads
+    // and the reaper loop exit, then break the accept loop by closing the
+    // listener. A signal-hook watcher thread (not tokio::signal: the
+    // multi-thread runtime's signal driver can stall here when blocking
+    // client threads hold the shared lock — observed: SIGTERM worked but
+    // SIGINT never fired the tokio handler) flips an AtomicBool that the
+    // async serve loop polls.
+    let _ = sched.clone(); // Sched.shutdown is set from the accept loop bridge below.
+    let shutdown_fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shutdown_fired_watcher = shutdown_fired.clone();
+    // SAFETY: handler only performs an atomic store (async-signal-safe).
+    unsafe {
+        let _ = signal_hook::low_level::register(signal_hook::consts::SIGINT, move || {
+            shutdown_fired_watcher.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let shutdown_fired_term = shutdown_fired.clone();
+        let _ = signal_hook::low_level::register(signal_hook::consts::SIGTERM, move || {
+            shutdown_fired_term.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+    let shutdown_flag = shutdown_fired.clone();
     // Reap orphan pending tasks from a previous run: terminals are gone,
     // so they count as early exits (failed ledger rows, no replay).
     reap_previous_run(&sched);
@@ -36,13 +61,33 @@ pub async fn serve(root: &Path) -> anyhow::Result<()> {
         let s = sched.clone();
         std::thread::spawn(move || reap_loop(s));
     }
+    // tokio::select on a blocking accept() cannot observe the shutdown
+    // flag (accept has no timeout). Poll it with a 100ms timeout so
+    // Ctrl-C breaks the loop promptly after the flag is set.
+    listener.set_nonblocking(true)?;
     loop {
-        let (stream, _) = listener.accept()?;
-        let s = sched.clone();
-        std::thread::spawn(move || {
-            let _ = handle_conn(s, stream);
-        });
+        // Bridge the signal-hook flag into the Sched flag the pump/reaper
+        // threads observe.
+        if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            sched.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if sched.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let s = sched.clone();
+                std::thread::spawn(move || {
+                    let _ = handle_conn(s, stream);
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
+    Ok(())
 }
 
 fn reap_previous_run(sched: &Arc<Sched>) {
@@ -135,7 +180,15 @@ fn sweep_dead_terminals(sched: &Arc<Sched>) -> (Vec<String>, Vec<String>) {
 
 fn reap_loop(sched: Arc<Sched>) {
     loop {
+        // Shutdown gate first: without this the 10s sleep keeps the
+        // process alive forever after Ctrl-C (the reported hang).
+        if sched.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         std::thread::sleep(std::time::Duration::from_secs(10));
+        if sched.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         // Idle pool TTL 60s.
         {
             let mut idle = sched.idle.lock().unwrap();
