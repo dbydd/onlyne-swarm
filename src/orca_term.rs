@@ -125,19 +125,29 @@ pub fn focus(handle: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Liveness probe: true while Orca still knows the handle. A dead tab
-/// (exited pi, closed tab, stale handle) answers ok:false, which the
-/// reaper treats as a terminal-dead signal. Pure best-effort read.
+/// Interpret an Orca `terminal show --json` response. This pure function
+/// keeps the dead-session contract testable without global env mutation.
+/// Probe failures/stale handles are *unknown*, treated alive: only an explicit
+/// `status=exited|closed|dead` lets the reaper fail/retry a task.
+pub fn terminal_is_alive_response(v: Option<&Value>) -> bool {
+    let Some(v) = v else { return true };
+    if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
+        return true;
+    }
+    let status = v.pointer("/result/terminal/status").and_then(|s| s.as_str());
+    !matches!(status, Some("exited") | Some("closed") | Some("dead"))
+}
+
+/// Liveness probe: only explicit exited status means dead; RPC failures stay
+/// alive/unknown so transient Orca races cannot kill a working hop.
 pub fn is_alive(handle: &str) -> bool {
     if handle.is_empty() || handle.starts_with("stub-") {
         return true; // stubs have no orca tab; never declare them dead
     }
     let mut cmd = orca();
     cmd.args(["terminal", "show", "--terminal", handle]);
-    match run_json(cmd) {
-        Ok(v) => v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false),
-        Err(_) => false,
-    }
+    let response = run_json(cmd).ok();
+    terminal_is_alive_response(response.as_ref())
 }
 
 pub fn close(handle: &str) -> anyhow::Result<()> {
@@ -147,12 +157,10 @@ pub fn close(handle: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Kill exactly this hop's pi process: the one whose command line carries
-/// this terminal's ONLYNE_SWARM_TASK value. Scoped two ways — first to
-/// children of the terminal shell (`-P $$`), then to the task id on the
-/// command line — so a cancel can never SIGTERM a foreign session. The old
-/// `pgrep pi | head -1` global fallback is gone on purpose: in a marquee
-/// test it could hit the supervisor or a sibling hop.
+/// Legacy/manual shell helper, kept for external operators only. The scheduler
+/// never calls it: interactive pi owns terminal input, so Orca tab close is
+/// the only reliable default reclamation primitive.
+#[allow(dead_code)]
 pub fn kill_pi_for_task(handle: &str, task_id: &str) -> anyhow::Result<()> {
     let task_id = shell_escape(task_id);
     send(handle, &format!("pkill -TERM -P $$ -f ONLYNE_SWARM_TASK={task_id} 2>/dev/null; exit"), true)
@@ -288,6 +296,14 @@ mod tests {
         );
         assert!(create_argv("t", true).contains(&"--focus".to_string()));
         assert!(!create_argv("t", false).iter().any(|a| a == "--worktree"));
+    }
+
+    #[test]
+    fn terminal_liveness_requires_explicit_exited_status() {
+        assert!(terminal_is_alive_response(None));
+        assert!(terminal_is_alive_response(Some(&json!({"ok": false}))));
+        assert!(terminal_is_alive_response(Some(&json!({"ok": true, "result": {"terminal": {"status": "running"}}}))));
+        assert!(!terminal_is_alive_response(Some(&json!({"ok": true, "result": {"terminal": {"status": "exited"}}}))));
     }
 
     #[test]

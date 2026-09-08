@@ -49,9 +49,17 @@ ratatui 实现的 swarm.sock 客户端（2s 全量轮询 + 事件驱动刷新）
 
 2s 间隔全量 `list_workspaces` + `list_tasks` 轮询刷新（`subscribe` 流为后续增量源，当前版本轮询已满足排障需求）。按键 `↑↓/jk` 选任务，`f`/Enter 切 Orca tab，`c` 取消选中任务血缘族，`t` 切换 root swarm 开关，`q` 退出。
 
-## 4. 开关语义（toggle）
+## 4. 取消语义（cancel）
+
+`c` 取消选中 task 的血缘族（`transfer_send_to` 下游）。默认走自回收协议：
+调度器向各 workspace loopback 写 `---swarm-ctl recycle`，session ack
+`swarm_recycled` 后自行退出，调度器最多等 5 秒再关 tab。调度器不注入 shell
+kill 命令；无 ack 只记 `recycle_no_ack` 日志。CLI 侧 `cancel --force` 跳过
+ack 等待直接关 tab，是人工逃生口。
+
+## 5. 开关语义（toggle）
 
 关闭某 workspace 的 swarm 开关：排空后停止监听。存量任务执行到 out 写出，
 新 in 任务不再建 session，daemon 恢复通用 in/out 自动处理，
 状态写入该 workspace `[swarm] enabled = false`。首次宽容；排空中重复 toggle
-要求则强制杀该 workspace 全部 swarm terminal（running 记 failed 台账行）。
+要求则强制关闭该 workspace 全部 swarm terminal（running 记 failed 台账行）。

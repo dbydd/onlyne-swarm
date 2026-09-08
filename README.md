@@ -198,6 +198,31 @@ pi-onlyne tool surface. Old instance directories are not migrated: delete
 `.ws/` and `.onlyne/swarm.db`, then run `workspace create` again.
 Upgrade pi-onlyne to 0.7.0 in lockstep.
 
+## Reclaim Protocol
+
+Normal terminal recovery uses **control down, ack up, session self-exit**:
+
+1. Scheduler sends a header-only loopback control wire:
+
+   ```text
+   ---swarm-ctl
+   op: recycle
+   task_id: <task-id>
+   reason: <done|failed|cancel|operator>
+   ---
+   ```
+
+2. pi-onlyne intercepts this wire before the model sees it, sends
+   `swarm_recycled {task_id, terminal_handle, reason}` to its workspace daemon,
+   stops watching, clears the slot, and exits its own process.
+3. Scheduler observes/polls the ack for up to five seconds, then closes the
+   Orca tab regardless. Missing ack logs `recycle_no_ack`.
+
+`swarm_quit` also sends the ack (`quit:<reason>`) and self-exits, so an
+explicit quit immediately reaches `failed` in the ledger and never pins a
+Running task. `cancel --force` skips the ack window and immediately closes
+that task's Orca tab; it is the operator escape hatch.
+
 ## Release checks
 
 Run these checks before publishing a version:

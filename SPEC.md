@@ -122,10 +122,15 @@ attempt: <整数，首次为 1>
 ## 7. 成功 / 失败 / 取消
 
 - 成功：session 在目标 workspace out 中写出含 swarm 头（含 `task_id`）的结果消息。
-  收到 out 即 done，记台账，回收 terminal。
-- 失败：无 out 的早停（含 pi-onlyne 空回提醒也失败的情况）即 failed：记台账行，不写任何回调，不重放。
-- 取消：`onlyne-swarm cancel <task_id>` / TUI cancel 键按 `transfer_send_to` 血缘树终结任务族，
-  逐个杀 terminal 并记 cancelled 台账行。
+  收到 out 即 done，记台账；调度器向 session 发送 `---swarm-ctl recycle`，
+  session ack `swarm_recycled` 后自行退出，调度器关闭 Orca tab。
+- 失败：无 out 的早停即 failed：记台账，不写任何回调，不重放。死 tab reaper 只在
+  Orca 明确报告 `status=exited` 时介入；attempt 小于 3 时创建新 task_id 重投。
+- `swarm_quit`：session uplink `swarm_recycled`（`quit:<reason>`）后自行退出；
+  scheduler 立即记 failed，不重投。
+- 取消：`onlyne-swarm cancel <task_id>` / TUI cancel 键按 `transfer_send_to` 血缘树终结任务族。
+  默认发送 recycle 信令、等待最多 5 秒 ack、关闭 tab；`cancel --force` 立即关闭 tab，
+  是人工逃生口。调度器不再向 session 注入 shell kill 命令。
 - 完成信号：out 写入即成功信号；显式出口由 pi-onlyne swarm_* 工具承载。
 
 ## 8. pi-onlyne 改写（跨仓库，不另建插件）

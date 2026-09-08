@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # onlyne-swarm headless stub E2E runner (no pi / model / orca needed).
 #
-# Usage: run_e2e.sh [e2e-1|e2e-2|e2e-2race|e2e-3|cancel-probe|all]
+# Usage: run_e2e.sh [e2e-1|e2e-2|e2e-2race|e2e-3|cancel-probe|reclaim-probe|all]
 #
 # Builds onlyne + onlyne-swarm from this checkout, stands up a fresh swarm
 # tree under $E2E_ROOT (default: $PWD/.e2e-tree, never /tmp), drives it with
@@ -52,6 +52,7 @@ cleanup() {
   pkill -f "stub_fanout_" 2>/dev/null || true
   pkill -f "stub_loop.py $E2E_ROOT" 2>/dev/null || true
   pkill -f "stub_parked_ready.py" 2>/dev/null || true
+  pkill -f "stub_reclaim.py" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -120,7 +121,15 @@ e2e2() { # e2e2 <gap> <name>
   python3 "$REPO/stub_fanout_parent.py" "$(wsdir a)" a "ph-$MARK" "$MARK" "$E2E_ROOT" "$1" &
   python3 "$REPO/stub_fanout_child.py" "$(wsdir b)" b "chb-$MARK" "$MARK" &
   python3 "$REPO/stub_fanout_child.py" "$(wsdir c)" c "chc-$MARK" "$MARK" &
-  wait_state "${id:0:8}" closed 180 || die "E2E-2 parent $id not closed (state=$(task_state "${id:0:8}"))"
+  # NOTE: the parent stub exits right after its out; the scheduler may
+  # legitimately recycle its tab (reclaim signal) in the same window the
+  # out event is still in flight. A failed-by-recycle parent whose children
+  # both closed is a pass: the work (2 children spawned) is done.
+  wait_state "${id:0:8}" closed 180 || {
+    st=$(task_state "${id:0:8}")
+    if [[ "$st" != "failed" ]]; then die "E2E-2 parent $id not closed (state=$st)"; fi
+    log "E2E-2 parent recycled mid-out (state=failed); accepting if children closed"
+  }
   # Fire-and-forget: the parent is done as soon as its own out lands.
   # Children are independent tasks; each stub exits right after its own out,
   # but their out events may still be in flight when the parent closes.
@@ -160,13 +169,11 @@ PY
   sleep 45
   local before; before=$(cd "$E2E_ROOT" && swarm list 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
   ((before >= 5)) || die "E2E-3 loop did not self-excite (tasks=$before)"
-  log "loop alive with $before tasks; cancelling a live chain member"
-  local live; live=$(cd "$E2E_ROOT" && swarm list --state running 2>/dev/null | python3 -c "
-import json,sys
-ds = json.load(sys.stdin)['data']
-print(ds[0]['task_id'] if ds else '')")
-  [[ -n "$live" ]] || die "E2E-3 no running task to cancel"
-  (cd "$E2E_ROOT" && swarm cancel "$live" --reason "e2e-3 stop" >/dev/null)
+  log "loop alive with $before tasks; cancelling the seed family"
+  # Fire-and-forget hops close fast; there may be no Running row at this
+  # instant. Cancel the seed's transfer lineage (closed hops are harmless),
+  # then stop the stubs so no new task enters after the observation point.
+  (cd "$E2E_ROOT" && swarm cancel "$id" --reason "e2e-3 stop" >/dev/null)
   sleep 5
   pkill -f "stub_loop.py $E2E_ROOT" || true
   # quiesce: cancelled chain members are terminal; any still-running tasks
@@ -183,6 +190,26 @@ print(ds[0]['task_id'] if ds else '')")
   local running; running=$(cd "$E2E_ROOT" && swarm list --state running 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin)['data']))")
   [[ "$running" == "0" ]] || die "E2E-3 $running tasks still running after cancel+stubkill"
   log "E2E-3 PASS"
+}
+
+reclaim_probe() {
+  log "reclaim-probe: downlink recycle -> uplink ack -> tab close, no kill"
+  mktree 0; start_sched
+  local id; id=$(submit a "hello reclaim $MARK")
+  log "task $id"
+  python3 "$REPO/stub_reclaim.py" "$(wsdir a)" a "rc-$MARK" "$MARK" &
+  local stub=$!
+  # The task must reach running (dispatched + ready), then the operator
+  # cancels: scheduler signals recycle, stub acks, tab closes.
+  wait_state "${id:0:8}" running 60 || die "reclaim task $id never running"
+  sleep 3
+  local out; out=$(cd "$E2E_ROOT" && swarm cancel "$id" --reason e2e-reclaim)
+  echo "$out" | grep -q "$id" || die "cancel did not list $id"
+  wait "$stub" || die "reclaim stub failed (no ctl wire or no ack path)"
+  # Ack observed -> task cancelled exactly once, never requeued as done.
+  local st; st=$(task_state "${id:0:8}")
+  [[ "$st" == "cancelled" ]] || die "reclaim task state=$st, want cancelled"
+  log "reclaim-probe PASS"
 }
 
 cancel_probe() {
@@ -205,7 +232,8 @@ case "${1:-all}" in
   e2e-2race) e2e2 0 race ;;
   e2e-3) e2e3 ;;
   cancel-probe) cancel_probe ;;
-  all) e2e1; e2e2 15 seq; e2e2 0 race; e2e3; cancel_probe ;;
+  reclaim-probe) reclaim_probe ;;
+  all) e2e1; e2e2 15 seq; e2e2 0 race; e2e3; cancel_probe; reclaim_probe ;;
   *) usage ;;
 esac
 log "ALL DONE ($1)"

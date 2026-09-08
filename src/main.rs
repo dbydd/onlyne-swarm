@@ -52,11 +52,15 @@ enum Cmd {
         #[arg(long)]
         payload: PathBuf,
     },
-    /// Cancel a task family
+    /// Cancel a task family (signal + ack + tab close; no shell injection)
     Cancel {
         task_id: String,
         #[arg(long)]
         reason: Option<String>,
+        /// Manual escape hatch: scoped pkill inside the tab before closing.
+        /// Off the default path; the session normally dies by its own hand.
+        #[arg(long)]
+        force: bool,
     },
     /// List tasks or workspaces
     List {
@@ -163,12 +167,12 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())
         }
-        Cmd::Cancel { task_id, reason } => {
+        Cmd::Cancel { task_id, reason, force } => {
             let cwd = std::env::current_dir()?;
             let root_p = root::cwd_root(&cwd);
             let v = orca::client_request(
                 &root::swarm_sock(&root_p),
-                serde_json::json!({"id": "cli", "op": "cancel", "task_id": task_id, "reason": reason}),
+                serde_json::json!({"id": "cli", "op": "cancel", "task_id": task_id, "reason": reason, "force": force}),
             )?;
             println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())

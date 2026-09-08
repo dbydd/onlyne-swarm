@@ -94,6 +94,13 @@ pub fn render(header: &SwarmHeader, role: &str, payload_markdown: &str) -> Strin
     s
 }
 
+/// Downlink recycle wire (scheduler -> session). Header-only marker the
+/// session intercepts before the model sees anything. `task_id` is the
+/// current claim, or `*` for whatever the session holds.
+pub fn render_ctl(task_id: &str, reason: &str) -> String {
+    format!("---swarm-ctl\nop: recycle\ntask_id: {task_id}\nreason: {reason}\n---\n")
+}
+
 /// Marker prefixes for ledger `reason` fields. Failure/cancel reasons travel
 /// in the ledger row, not in a callback message body (amendment-1: there are
 /// no callbacks). Kept as helpers so reason strings stay uniform.
@@ -134,5 +141,17 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         let m = parse(&format!("---swarm\ntask_id: {id}\nfrom: a\n---")).unwrap();
         assert_eq!(m.header.task_id, id);
+    }
+
+    #[test]
+    fn ctl_wire_renders_and_never_parses_as_task() {
+        // Reclaim protocol: the ctl wire must not claim a slot.
+        let wire = render_ctl("some-task", "cancel");
+        assert!(wire.starts_with("---swarm-ctl\n"));
+        assert!(wire.contains("op: recycle"));
+        assert!(wire.contains("task_id: some-task"));
+        assert!(parse(&wire).is_none());
+        // Task parser also rejects the bare prefix without newline.
+        assert!(parse("---swarm-ctl\nop: recycle\n---\n").is_none());
     }
 }

@@ -95,6 +95,28 @@ fn route_event(
             }
         }
         "workspace_state_changed" => {
+            // pi-onlyne swarm-mode recycle ack arrives as WorkspaceStateChanged
+            // `swarm_recycled {task_id, terminal_handle, reason}`.
+            // close_terminal may already have observed the same ack by polling
+            // history; on_recycled is idempotent so a late event only closes
+            // the tab handle if it somehow remains.
+            let msg_all = data
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            if let Some(body) = msg_all.strip_prefix("swarm_recycled ") {
+                let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+                let task_id = parsed.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+                let reason = parsed.get("reason").and_then(|v| v.as_str()).unwrap_or("recycled");
+                tracing::info!(workspace = %ws_path, task = %task_id, reason = %reason, "swarm_recycled ack observed");
+                consumed_ack(stream, v);
+                if !task_id.is_empty() {
+                    if let Err(e) = sched::on_recycled(sched, task_id, reason) {
+                        tracing::warn!(error = %e, "on_recycled failed");
+                    }
+                }
+                return;
+            }
             // pi-onlyne swarm-mode handshake arrives as a WorkspaceStateChanged
             // event whose message is `swarm_ready {workspace, terminal_handle}`.
             let msg = data

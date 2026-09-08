@@ -37,6 +37,9 @@ pub struct Sched {
     pub idle: Mutex<HashMap<String, Vec<IdleTerminal>>>,
     /// task_id -> time the terminal was created (ready-timeout tracking).
     pub awaiting_ready: Mutex<HashMap<String, std::time::Instant>>,
+    /// task_id -> successful FIFO delivery time. Dead-terminal detection waits
+    /// a short grace window so an out event racing with process exit wins.
+    pub running_since: Mutex<HashMap<String, std::time::Instant>>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +57,7 @@ impl Sched {
             terminals: Mutex::new(HashMap::new()),
             idle: Mutex::new(HashMap::new()),
             awaiting_ready: Mutex::new(HashMap::new()),
+            running_since: Mutex::new(HashMap::new()),
         })
     }
 
@@ -257,6 +261,7 @@ fn deliver_to_terminal(
     };
     let wire = crate::proto::render(&header, &role, &task.payload);
     write_loopback_in(&crate::root::resolve_instance(&sched.root, to), &wire)?;
+    sched.running_since.lock().unwrap().insert(task_id.into(), std::time::Instant::now());
     sched.db.set_terminal(task_id, handle)?;
     sched
         .terminals
@@ -362,9 +367,18 @@ pub fn on_early_exit(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow:
     Ok(())
 }
 
-/// Cancel a task family: kill terminals, mark cancelled, append ledger rows.
+/// Cancel a task family: mark cancelled, append ledger rows, recycle tabs.
 /// Lineage follows transfer_send_to downstream (spawns), not upstream waits.
+/// Sessions die by their own hand (reclaim protocol); see close_terminal.
+/// `force` adds the operator-only scoped pkill before tab close.
+#[allow(dead_code)]
 pub fn cancel(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::Result<Vec<String>> {
+    cancel_force(sched, task_id, reason, false)
+}
+
+/// Cancel with the manual escape hatch: `force` runs the task-scoped pkill
+/// inside each tab before closing it. Off the default path.
+pub fn cancel_force(sched: &Arc<Sched>, task_id: &str, reason: &str, force: bool) -> anyhow::Result<Vec<String>> {
     let fam = sched.db.family(task_id)?;
     let mut out = vec![];
     for t in &fam {
@@ -387,6 +401,9 @@ pub fn cancel(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::Result
                 reason: crate::proto::cancelled_reason(reason),
             },
         );
+        if force {
+            force_kill(sched, &t.task_id);
+        }
         close_terminal(sched, &t.task_id)?;
         out.push(t.task_id.clone());
         sched.emit(
@@ -397,17 +414,141 @@ pub fn cancel(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::Result
     Ok(out)
 }
 
+/// Called when the session uplinks `swarm_recycled`. A worker quit is an
+/// explicit failure decision: close its ledger life immediately, never
+/// requeue. A normal done task was already closed by on_out, so it is a no-op.
+pub fn on_recycled(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::Result<()> {
+    let Some(task) = sched.db.get(task_id)? else {
+        return Ok(());
+    };
+    if task.state == crate::db::TaskState::Done
+        || task.state == crate::db::TaskState::Closed
+        || task.state == crate::db::TaskState::Cancelled
+        || task.state == crate::db::TaskState::Failed
+    {
+        close_tab_only(sched, task_id)?;
+        return Ok(());
+    }
+    sched.db.set_state(task_id, crate::db::TaskState::Failed)?;
+    let reason = format!("swarm-recycled: {reason}");
+    sched.db.set_ledger(task_id, "failed", "", &reason)?;
+    crate::db::append_ledger_line(
+        &sched.root,
+        &crate::db::LedgerEvent {
+            task_id: task_id.into(),
+            transfer_send_to: task.transfer_send_to.clone(),
+            from_ws: task.from_ws.clone(),
+            to_ws: task.to_ws.clone(),
+            state: "failed".into(),
+            out_head: String::new(),
+            reason: crate::proto::failed_reason(&reason),
+        },
+    );
+    sched.emit(
+        "task_failed",
+        serde_json::json!({"task_id": task_id, "to": task.to_ws, "reason": reason}),
+    );
+    close_tab_only(sched, task_id)
+}
+
+/// Remove the tracked tab and close it. The session has already accepted a
+/// recycle/quit, so this must not send another downlink control message.
+fn close_tab_only(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
+    sched.running_since.lock().unwrap().remove(task_id);
+    let handle = sched.terminals.lock().unwrap().remove(task_id);
+    if let Some(h) = handle {
+        if !h.starts_with("stub-") {
+            let _ = crate::orca_term::close(&h);
+        }
+    }
+    Ok(())
+}
+
+/// Signal the session to recycle itself, then close the tab.
+/// Ownership (amendment 3): the session dies by its own hand — the scheduler
+/// sends the downlink signal, waits briefly for the `swarm_recycled` ack,
+/// then closes the Orca tab regardless. No shell injection on this path.
+fn signal_recycle(sched: &Arc<Sched>, task_id: &str, reason: &str) {
+    let task = sched.db.get(task_id).ok().flatten();
+    let to = task.map(|t| t.to_ws).unwrap_or_default();
+    let to = if to.is_empty() { ".".into() } else { to };
+    let ws = crate::root::resolve_instance(&sched.root, &to);
+    let _ = write_loopback_in(&ws, &crate::proto::render_ctl(task_id, reason));
+}
+
+/// Wait up to `timeout` for the session's `swarm_recycled` ack, polling the
+/// daemon history for the ack line. Returns true on ack.
+fn wait_recycled_ack(sched: &Arc<Sched>, task_id: &str, timeout: std::time::Duration) -> bool {
+    let task = sched.db.get(task_id).ok().flatten();
+    let to = task.map(|t| t.to_ws).unwrap_or_default();
+    let to = if to.is_empty() { ".".into() } else { to };
+    let ws = crate::root::resolve_instance(&sched.root, &to);
+    let sock = crate::root::onlyne_sock(&ws);
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(hist) = daemon_history(&sock, 10) {
+            for line in hist {
+                if line.contains("swarm_recycled") && line.contains(task_id) {
+                    return true;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    false
+}
+
+/// One-shot fetch of recent loopback history lines from a workspace daemon.
+fn daemon_history(sock: &std::path::Path, limit: usize) -> anyhow::Result<Vec<String>> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut s = std::os::unix::net::UnixStream::connect(sock)?;
+    let req = serde_json::json!({
+        "id": "reclaim-probe",
+        "op": "fetch_channel_history",
+        "channel_id": "loopback",
+        "limit": limit,
+    });
+    writeln!(s, "{req}")?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
+    let mut r = BufReader::new(&s);
+    let mut out = String::new();
+    r.read_line(&mut out)?;
+    let v: serde_json::Value = serde_json::from_str(&out)?;
+    let items = v.pointer("/data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    Ok(items
+        .iter()
+        .filter_map(|m| m.get("text").and_then(|t| t.as_str()).map(String::from))
+        .collect())
+}
+
+/// Operator-only escape hatch: force close the Orca tab immediately.
+/// There is deliberately no scheduler-side shell injection: once pi owns the
+/// terminal input, sending `pkill` text is not a reliable shell command and
+/// can target the wrong process. Orca tab close is the supervisor primitive.
+fn force_kill(sched: &Arc<Sched>, task_id: &str) {
+    let handle = sched.terminals.lock().unwrap().get(task_id).cloned();
+    if let Some(h) = handle {
+        if !h.starts_with("stub-") {
+            let _ = crate::orca_term::close(&h);
+        }
+    }
+}
+
 fn close_terminal(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
+    sched.running_since.lock().unwrap().remove(task_id);
     let handle = sched.terminals.lock().unwrap().remove(task_id);
     if let Some(h) = handle {
         if h.starts_with("stub-") {
             return Ok(());
         }
-        // Best effort: kill pi, then close the orca terminal tab.
-        // kill first (reclaims the pi process); close drops the tab even if
-        // the process already exited, so no orphan tabs accumulate in Orca.
-        // Scoped to this hop's task id: never a global pgrep sweep.
-        let _ = crate::orca_term::kill_pi_for_task(&h, task_id);
+        // Reclaim protocol: signal, wait briefly for the ack, close the tab
+        // regardless. The session exits its own process; the scheduler only
+        // ever touches the Orca tab object. No shell injection here —
+        // kill_pi_for_task is operator-only (cancel --force).
+        signal_recycle(sched, task_id, "close");
+        if !wait_recycled_ack(sched, task_id, std::time::Duration::from_secs(5)) {
+            tracing::warn!(task = %task_id, handle = %h, "recycle_no_ack");
+        }
         let _ = crate::orca_term::close(&h);
     }
     Ok(())
@@ -507,6 +648,17 @@ mod sched_tests {
         assert_eq!(s.db.get("p").unwrap().unwrap().state, TaskState::Running);
         let tail = s.db.ledger(10).unwrap();
         assert!(tail.iter().any(|e| e.task_id == "c" && e.state == "failed"));
+    }
+
+    #[test]
+    fn recycled_quit_marks_failed_without_retry() {
+        let s = test_sched();
+        seed(&s, "quit1", "a", "", TaskState::Running);
+        on_recycled(&s, "quit1", "quit:no input").unwrap();
+        let t = s.db.get("quit1").unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Failed);
+        let tail = s.db.ledger(10).unwrap();
+        assert!(tail.iter().any(|e| e.task_id == "quit1" && e.reason.contains("swarm-recycled")));
     }
 
     #[test]

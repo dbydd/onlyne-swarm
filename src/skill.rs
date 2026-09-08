@@ -119,6 +119,13 @@ The session sends `swarm_ready`, claims exactly that env task from history
 follow-up, pins its tab title to `swarm:<to>:<id8>`, and completes through
 the plugin swarm tools.
 
+Reclaim is cooperative: when a hop ends (done, failed, cancelled), the
+scheduler writes a `---swarm-ctl` recycle wire to the workspace loopback, the
+session acks `swarm_recycled` and exits its own process, and only then does
+the scheduler close the Orca tab. `swarm_quit` uses the same ack path. The
+scheduler never injects shell kill commands; `cancel --force` is the operator
+escape hatch and closes the tab immediately.
+
 ## Visibility in Orca
 
 Hop terminals live under the swarm root worktree as background tabs titled
@@ -137,13 +144,13 @@ onlyne-swarm status
 onlyne-swarm list --state running
 onlyne-swarm tui
 onlyne-swarm cancel <task-id> --reason "manual stop"
+onlyne-swarm cancel <task-id> --force --reason "stuck session"
 ```
 
 `task_id` names the whole lineage family. Cyclic graphs run until the operator
 cancels; there is no timeout, retry, or loop breaker. Cancelled tasks record
 `swarm-cancelled` ledger rows; an exited session records `swarm-failed`.
 Ledger tail is visible from `status` and the TUI.
-
 ## Refresh this skill
 
 ```bash
@@ -192,6 +199,8 @@ mod tests {
         assert!(body.contains("onlyne-swarm export-skill"));
         assert!(body.contains("template.workspace.schema.json"));
         assert!(body.contains("onlyne_in/"));
+        assert!(body.contains("swarm-ctl"));
+        assert!(body.contains("cancel --force"));
         assert!(!dir.path().join(".agents/skills/SKILL.md").exists());
     }
 }

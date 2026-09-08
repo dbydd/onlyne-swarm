@@ -49,6 +49,28 @@ out 即成功信号（done），调度器记台账并回收 terminal，不做任
 失败与取消不写消息体：早停记 failed 台账行，cancel 记 cancelled 台账行。
 `swarm-failed:` / `swarm-cancelled:` 前缀只出现在 ledger `reason` 字段。
 
+## 3b. 回收控制线（`---swarm-ctl`）
+
+调度器回收 terminal 时先向下行 loopback 写一条纯头部控制线：
+
+```text
+---swarm-ctl
+op: recycle
+task_id: 550e8400-e29b-41d1-a716-446655440000
+reason: done
+---
+```
+
+- `task_id` 可填 `*`：表示该 workspace 当前占用的 hop 一律回收。
+- `reason` ∈ `done` / `failed` / `cancel` / `operator`。
+- 上行 ack：session 调 `swarm_recycled` IPC op，body JSON
+  `{workspace, terminal_handle, task_id, reason}`；daemon 原样广播
+  `workspace_state_changed`。
+- session 收到控制线后自行 `process.exit`，调度器随后 `orca terminal close`。
+  调度器向不再存活的进程注入 shell kill 被明确禁止。
+- 控制线对模型不可见：pi-onlyne 在投递前拦截，任务 catchup 扫描也排除
+  `---swarm-ctl` 前缀。
+
 ## 4. 示例
 
 顶层提交：

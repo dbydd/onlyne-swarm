@@ -31,7 +31,7 @@ seen = set()
 while True:
     for m in fetch_loopback(ws, 30):
         t = m.get("text") or ""
-        if not t.startswith("---swarm") or m.get("direction") != "inbound":
+        if not t.startswith("---swarm") or t.startswith("---swarm-ctl") or m.get("direction") != "inbound":
             continue
         tid, transfer = header_fields(t)
         if not tid or tid in seen or "stub reply" in t:

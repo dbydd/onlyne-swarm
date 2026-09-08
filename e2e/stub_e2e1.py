@@ -24,7 +24,7 @@ send_ready(ws, handle)
 
 text = wait_for_task(
     ws,
-    lambda t, m: t.startswith("---swarm") and marker in t
+    lambda t, m: t.startswith("---swarm") and not t.startswith("---swarm-ctl") and marker in t
     and "stub reply" not in t,
 )
 if not text:

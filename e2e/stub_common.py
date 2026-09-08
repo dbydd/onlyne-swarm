@@ -99,3 +99,27 @@ def wait_for_task(ws, predicate, timeout=120, limit=10, poll=1.0):
                 return t
         time.sleep(poll)
     return ""
+
+
+def send_recycled(ws, task_id, handle, reason):
+    """Uplink ack for the reclaim protocol (mirrors pi-onlyne swarmRecycled)."""
+    r = rpc(ws, {
+        "id": "recycled",
+        "op": "swarm_recycled",
+        "text": __import__("json").dumps({"task_id": task_id, "terminal_handle": handle, "reason": reason}),
+    })
+    print("recycled:", r.get("ok"), task_id, flush=True)
+    return r.get("ok")
+
+
+def wait_for_ctl(ws, timeout=30, poll=0.5):
+    """Poll loopback history for a ---swarm-ctl recycle wire. Returns text."""
+    import time as _t
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        for m in fetch_loopback(ws, 10):
+            t = m.get("text") or ""
+            if m.get("direction") == "inbound" and t.startswith("---swarm-ctl"):
+                return t
+        _t.sleep(poll)
+    return ""

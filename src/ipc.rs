@@ -66,13 +66,23 @@ fn sweep_dead_terminals(sched: &Arc<Sched>) -> (Vec<String>, Vec<String>) {
     // exited without writing out) would otherwise sit in running
     // forever. Detect via `terminal show`, record failed, and requeue
     // with attempt+1 so the hop is retried in a fresh terminal.
-    // Attempt cap lives here, not in dispatch: dispatch stays dumb.
+    // Attempt cap lives here, not in dispatch. A 15s delivery grace avoids
+    // racing a clean stub/session exit against the daemon's out event relay.
+    const DELIVERY_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+    let since = sched.running_since.lock().unwrap().clone();
     let running: Vec<(String, String, u32)> = sched
         .db
         .list(Some("running"), 200)
         .unwrap_or_default()
         .into_iter()
-        .filter(|r| !r.terminal.is_empty() && !r.terminal.starts_with("stub-"))
+        .filter(|r| {
+            !r.terminal.is_empty()
+                && !r.terminal.starts_with("stub-")
+                && since
+                    .get(&r.task_id)
+                    .map(|t| t.elapsed() >= DELIVERY_GRACE)
+                    .unwrap_or(false)
+        })
         .map(|r| (r.task_id.clone(), r.terminal.clone(), r.attempt))
         .collect();
     for (task_id, handle, attempt) in running {
@@ -250,7 +260,8 @@ fn handle_conn(sched: Arc<Sched>, stream: UnixStream) -> anyhow::Result<()> {
             "cancel" => {
                 let task_id = req.get("task_id").and_then(|t| t.as_str()).unwrap_or("");
                 let reason = req.get("reason").and_then(|r| r.as_str()).unwrap_or("cancelled");
-                match sched::cancel(&sched, task_id, reason) {
+                let force = req.get("force").and_then(|f| f.as_bool()).unwrap_or(false);
+                match sched::cancel_force(&sched, task_id, reason, force) {
                     Ok(ids) => write_resp(
                         &mut writer,
                         &id,
@@ -346,35 +357,41 @@ mod tests {
     }
 
     #[test]
-    fn dead_terminal_fails_and_retries_with_attempt_bump() {
-        // SWARM_STUB_AGENT=1 makes orca_term a no-op: is_alive("stub-*")
-        // returns true, so drive the sweep through a fake dead handle by
-        // pointing ORCA_CLI_COMMAND at /bin/false (run_json fails -> dead).
+    fn sweep_ignores_stub_handles() {
         std::env::set_var("ORCA_CLI_COMMAND", "/bin/false");
         let s = test_sched();
-        // Dead handle: orca unreachable -> is_alive false -> failed + retry.
-        s.db.insert_task("dead1", ".", "a", "", 1, "p").unwrap();
-        s.db.set_state("dead1", TaskState::Running).unwrap();
-        s.db.set_terminal("dead1", "term-dead-handle").unwrap();
+        s.db.insert_task("stub1", ".", "a", "", 1, "p").unwrap();
+        s.db.set_state("stub1", TaskState::Running).unwrap();
+        s.db.set_terminal("stub1", "stub-term").unwrap();
         let (failed, retried) = sweep_dead_terminals(&s);
-        assert_eq!(failed, vec!["dead1"]);
-        assert_eq!(retried.len(), 1);
-        assert_eq!(s.db.get("dead1").unwrap().unwrap().state, TaskState::Failed);
-        let r = s.db.get(&retried[0]).unwrap().unwrap();
-        assert_eq!(r.attempt, 2);
-        assert_eq!(r.to_ws, "a");
+        assert!(failed.is_empty());
+        assert!(retried.is_empty());
         std::env::remove_var("ORCA_CLI_COMMAND");
     }
 
     #[test]
-    fn dead_terminal_at_cap_fails_without_retry() {
+    fn fresh_delivery_skips_dead_terminal_in_grace() {
         std::env::set_var("ORCA_CLI_COMMAND", "/bin/false");
         let s = test_sched();
-        s.db.insert_task("dead3", ".", "a", "", 3, "p").unwrap();
-        s.db.set_state("dead3", TaskState::Running).unwrap();
-        s.db.set_terminal("dead3", "term-dead-handle").unwrap();
+        s.db.insert_task("fresh1", ".", "a", "", 1, "p").unwrap();
+        s.db.set_state("fresh1", TaskState::Running).unwrap();
+        s.db.set_terminal("fresh1", "term-fresh").unwrap();
+        // Inside the grace window: never reaped, even though the orca probe
+        // would say dead (the out-event race the sweep must not win).
+        s.running_since.lock().unwrap().insert("fresh1".into(), std::time::Instant::now());
         let (failed, retried) = sweep_dead_terminals(&s);
-        assert_eq!(failed, vec!["dead3"]);
+        assert!(failed.is_empty());
+        assert!(retried.is_empty());
+        // Older than grace still stays untouched when the Orca probe is
+        // unavailable: only an explicit `status=exited` may fail a task.
+        // The explicit-status parser has dedicated unit coverage in
+        // orca_term::tests::terminal_liveness_requires_explicit_exited_status.
+        s.running_since.lock().unwrap().insert(
+            "fresh1".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(30),
+        );
+        let (failed, retried) = sweep_dead_terminals(&s);
+        assert!(failed.is_empty());
         assert!(retried.is_empty());
         std::env::remove_var("ORCA_CLI_COMMAND");
     }
