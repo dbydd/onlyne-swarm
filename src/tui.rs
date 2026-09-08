@@ -9,7 +9,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Row, Table},
 };
 
 /// Ratatui monitoring panel (TUI.md): left tree (workspaces + back_edges +
@@ -141,13 +141,6 @@ fn pull(sock: &Path) -> Snapshot {
     Snapshot { status, workspaces, tasks }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Overlay {
-    None,
-    Help,
-    ConfirmCancel,
-}
-
 fn run_loop(
     term: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     sock: &Path,
@@ -155,42 +148,10 @@ fn run_loop(
     let mut snap = pull(sock);
     let mut selected: usize = 0;
     let mut msg = String::new();
-    let mut overlay = Overlay::None;
     loop {
-        term.draw(|f| render(f, &snap, selected, &msg, overlay))?;
+        term.draw(|f| render(f, &snap, selected, &msg))?;
         if event::poll(Duration::from_millis(500))? {
             if let Event::Key(k) = event::read()? {
-                if overlay == Overlay::Help {
-                    match k.code {
-                        KeyCode::Char('?') | KeyCode::Esc | KeyCode::Enter => overlay = Overlay::None,
-                        _ => {}
-                    }
-                    continue;
-                }
-                if overlay == Overlay::ConfirmCancel {
-                    match k.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            if let Some(t) = snap.tasks.get(selected) {
-                                let id = t.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                                match req(
-                                    sock,
-                                    serde_json::json!({"id":"t","op":"cancel","task_id":id,"reason":"tui cancel"}),
-                                ) {
-                                    Ok(_) => msg = format!("cancelled {id}"),
-                                    Err(e) => msg = format!("cancel failed: {e}"),
-                                }
-                                snap = pull(sock);
-                            }
-                            overlay = Overlay::None;
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                            msg = "cancel skipped".into();
-                            overlay = Overlay::None;
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -200,14 +161,18 @@ fn run_loop(
                         selected = selected.saturating_add(1)
                     }
                     KeyCode::Char('c') => {
-                        if snap.tasks.get(selected).is_some() {
-                            overlay = Overlay::ConfirmCancel;
+                        // Cancel the selected task family.
+                        if let Some(t) = snap.tasks.get(selected) {
+                            let id = t.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+                            match req(
+                                sock,
+                                serde_json::json!({"id":"t","op":"cancel","task_id":id,"reason":"tui cancel"}),
+                            ) {
+                                Ok(_) => msg = format!("cancelled {id}"),
+                                Err(e) => msg = format!("cancel failed: {e}"),
+                            }
+                            snap = pull(sock);
                         }
-                    }
-                    KeyCode::Char('?') => overlay = Overlay::Help,
-                    KeyCode::Char('r') => {
-                        snap = pull(sock);
-                        msg = "refreshed".into();
                     }
                     KeyCode::Char('f') | KeyCode::Enter => {
                         // Focus the Orca tab of the selected task's session.
@@ -261,7 +226,6 @@ fn render(
     snap: &Snapshot,
     selected: usize,
     msg: &str,
-    overlay: Overlay,
 ) {
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -411,55 +375,10 @@ fn render(
 
     f.render_widget(
         Paragraph::new(format!(
-            "[↑↓/jk] select  [f/enter] focus  [c]ancel  [r]efresh  [?]help  [t]oggle swarm  [q]uit    {msg}"
+            "[↑↓/jk] select  [f/enter] focus orca tab  [c]ancel family  [t]oggle swarm  [q]uit    {msg}"
         ))
         .block(Block::default().title("keys").borders(Borders::ALL)),
         root[1],
-    );
-
-    match overlay {
-        Overlay::None => {}
-        Overlay::Help => render_overlay(
-            f,
-            "help",
-            "↑/↓ or j/k   select task\n\nf or Enter     focus selected Orca tab\n\nc              request cancel confirmation\n\ny / n          confirm / skip a pending cancel\n\nr              refresh now\n\nt              toggle root swarm intake\n\n? or Esc       close this panel\nq              quit TUI",
-        ),
-        Overlay::ConfirmCancel => {
-            let id = snap
-                .tasks
-                .get(selected)
-                .and_then(|t| t.get("task_id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            render_overlay(
-                f,
-                "cancel task family?",
-                &format!(
-                    "This cancels {} and every downstream task linked by transfer_send_to.\n\n[y] cancel family    [n/Esc] keep running",
-                    id.get(..8.min(id.len())).unwrap_or(id)
-                ),
-            );
-        }
-    }
-}
-
-fn render_overlay(f: &mut ratatui::Frame, title: &str, body: &str) {
-    let outer = f.area();
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(30), Constraint::Length(12), Constraint::Percentage(30)])
-        .split(outer);
-    let horizontal = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(18), Constraint::Percentage(64), Constraint::Percentage(18)])
-        .split(vertical[1]);
-    let area = horizontal[1];
-    f.render_widget(Clear, area);
-    f.render_widget(
-        Paragraph::new(body)
-            .block(Block::default().title(title).borders(Borders::ALL))
-            .style(Style::default().fg(Color::Yellow)),
-        area,
     );
 }
 
