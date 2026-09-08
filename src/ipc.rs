@@ -203,9 +203,11 @@ fn reap_loop(sched: Arc<Sched>) {
         // Dead-terminal sweep lives in sweep_dead_terminals (unit-tested).
         let (_failed, _retried) = sweep_dead_terminals(&sched);
         // Ready timeout 120s: terminal created but no swarm_ready.
-        // Guard: a task that already has a ready terminal (recorded handle
-        // differs from the stub placeholder or the out already landed) is
-        // not a stall — reaping it would kill a live working session.
+        // Guard (R4 fix): a task whose payload was actually written
+        // (`running_since` set only after `write_loopback_in` succeeds) is
+        // not a handshake stall — reaping it would kill a live working
+        // session. The old guard (terminal non-stub + state Running) was
+        // true from dispatch time, so a lost handshake hung forever.
         {
             let timed_out: Vec<String> = sched
                 .awaiting_ready
@@ -215,13 +217,9 @@ fn reap_loop(sched: Arc<Sched>) {
                 .filter(|(_, t)| t.elapsed() > std::time::Duration::from_secs(120))
                 .map(|(k, _)| k.clone())
                 .collect();
+            let delivered_at = sched.running_since.lock().unwrap().clone();
             for task_id in timed_out {
-                let delivered = sched.db.get(&task_id).ok().flatten().map(|r| {
-                    !r.terminal.is_empty()
-                        && !r.terminal.starts_with("stub-")
-                        && (r.state == crate::db::TaskState::Running
-                            || r.state == crate::db::TaskState::Done)
-                }).unwrap_or(false);
+                let delivered = delivered_at.contains_key(&task_id);
                 sched.awaiting_ready.lock().unwrap().remove(&task_id);
                 if delivered {
                     continue;
@@ -306,6 +304,19 @@ fn handle_conn(sched: Arc<Sched>, stream: UnixStream) -> anyhow::Result<()> {
                 let counts = sched.db.counts().unwrap_or_default();
                 let tree = crate::template::load_tree(&sched.root).unwrap_or_default();
                 let health = crate::sync::inspect(&sched.root).unwrap_or_default();
+                // R3: per-workspace swarm-ready rollup so the TUI and the
+                // operator see unready targets without opening each one.
+                let not_ready: Vec<_> = tree
+                    .iter()
+                    .filter_map(|e| {
+                        let path = if e.path.is_empty() { "." } else { &e.path };
+                        let ws = crate::root::resolve_instance(&sched.root, &e.path);
+                        let gaps = crate::sync::swarm_ready_gaps(&ws);
+                        (!gaps.is_empty()).then(|| {
+                            serde_json::json!({"workspace": path, "gaps": gaps})
+                        })
+                    })
+                    .collect();
                 let data = serde_json::json!({
                     "root": sched.root.to_string_lossy(),
                     "workspaces": tree.len(),
@@ -313,6 +324,7 @@ fn handle_conn(sched: Arc<Sched>, stream: UnixStream) -> anyhow::Result<()> {
                     "ledger_tail": sched.db.ledger(20).unwrap_or_default(),
                     "orphans": health.orphans,
                     "dangling": health.dangling,
+                    "not_swarm_ready": not_ready,
                 });
                 write_resp(&mut writer, &id, true, Some(data), None)?;
             }
@@ -332,12 +344,19 @@ fn handle_conn(sched: Arc<Sched>, stream: UnixStream) -> anyhow::Result<()> {
                         } else {
                             "offline"
                         };
+                        // R3: swarm-ready gates per workspace. A daemon can be
+                        // up while the session inside can never handshake
+                        // (missing [swarm], autoStart off, no plugin).
+                        let gaps = crate::sync::swarm_ready_gaps(&ws);
+                        let swarm_ready = gaps.is_empty();
                         serde_json::json!({
                             "path": path,
                             "name": e.name,
                             "model": {"provider": e.model.provider, "model": e.model.model, "effort": e.model.effort},
                             "back_edges": e.back_edges,
                             "daemon": daemon,
+                            "swarm_ready": swarm_ready,
+                            "swarm_ready_gaps": gaps,
                         })
                     })
                     .collect();
@@ -369,6 +388,24 @@ fn handle_conn(sched: Arc<Sched>, stream: UnixStream) -> anyhow::Result<()> {
                 let payload = req.get("payload_markdown").and_then(|p| p.as_str()).unwrap_or("");
                 // Supervisor submits from "." unless told otherwise.
                 let from = req.get("from").and_then(|f| f.as_str()).unwrap_or(".");
+                // R3: refuse fast when the target can never handshake.
+                // A silent 120s hang costs more than a loud rejection.
+                // Stub agents (headless e2e) have no .pi at all by design.
+                let stub = std::env::var("SWARM_STUB_AGENT").as_deref() == Ok("1");
+                if !stub {
+                    let target_ws = crate::root::resolve_instance(&sched.root, to);
+                    let gaps = crate::sync::swarm_ready_gaps(&target_ws);
+                    if !gaps.is_empty() {
+                        write_resp(
+                            &mut writer,
+                            &id,
+                            false,
+                            None,
+                            Some(format!("workspace '{to}' is not swarm-ready: {}", gaps.join("; "))),
+                        )?;
+                        continue;
+                    }
+                }
                 match sched::submit(&sched, from, to, payload) {
                     Ok(task_id) => write_resp(
                         &mut writer,
