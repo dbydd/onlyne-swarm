@@ -2,11 +2,13 @@
 
 Usage: stub_loop.py <workspace_abs> <tree_path> <handle> <peer_tree_path> <e2e_root>
 
-Runs until killed. Only loop tasks participate: a task is a loop task iff its
-body carries `loop-n=` or `loop-seed` and is not already a stub reply.
-Each hop forwards one new task to the peer (transfer_send_to = this task,
-lineage only) and immediately writes its own out. Nothing waits for anything:
-the loop advances because every hop exits right after spawning the next.
+Runs until killed. A delivered hop is claimed only from the scheduler's
+second wire. The next relay is advanced only when processing the raw
+swarm_send wire, so registration and execution each happen exactly once.
+Each delivered hop forwards one new raw task to the peer
+(transfer_send_to = this task, lineage only) and immediately writes its own
+out. Nothing waits for anything: the loop advances because every hop exits
+right after spawning the next.
 """
 import os
 import sys
@@ -14,8 +16,8 @@ import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from stub_common import (fetch_loopback, header_fields, reply_task,
-                         send_ready, wait_daemon)
+from stub_common import (fetch_loopback, header_fields, is_scheduler_delivery,
+                         reply_task, send_ready, wait_daemon)
 
 ws = os.path.realpath(sys.argv[1])
 tree_path = sys.argv[2]
@@ -31,7 +33,9 @@ seen = set()
 while True:
     for m in fetch_loopback(ws, 30):
         t = m.get("text") or ""
-        if not t.startswith("---swarm") or t.startswith("---swarm-ctl") or m.get("direction") != "inbound":
+        if not t.startswith("---swarm\n") or t.startswith("---swarm-ctl") or m.get("direction") != "inbound":
+            continue
+        if not is_scheduler_delivery(t):
             continue
         tid, transfer = header_fields(t)
         if not tid or tid in seen or "stub reply" in t:
@@ -59,5 +63,9 @@ while True:
         print(f"fwd {tid[:8]} -> {peer} loop-n={n} as {cid[:8]}", flush=True)
         reply_task(ws, tree_path, tid, transfer or "",
                    f"stub reply loop-n={n} from {tree_path}")
+        # A real pi process exits after the scheduler's recycle ctl. This
+        # persistent stub stands in for the next process and re-announces
+        # itself as idle so the next raw relay receives a second delivery.
+        send_ready(ws, handle)
         print(f"replied {tid[:8]}", flush=True)
     time.sleep(1.0)

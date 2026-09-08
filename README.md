@@ -202,6 +202,13 @@ pi-onlyne tool surface. Old instance directories are not migrated: delete
 `.ws/` and `.onlyne/swarm.db`, then run `workspace create` again.
 Upgrade pi-onlyne to 0.7.0 in lockstep.
 
+## Compatibility
+
+`pi-onlyne >= 0.8.1` requires `onlyne-swarm >= 0.5.0`. The scheduler's
+second task delivery writes `delivery: scheduler`; pi-onlyne uses this
+structured header field as its claim gate. Raw relay and out wires omit it,
+so arbitrary role prose stays independent from transport authentication.
+
 ## Reclaim Protocol
 
 Normal terminal recovery uses **control down, ack up, session self-exit**:

@@ -14,7 +14,7 @@ import time
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from stub_common import (header_fields, reply_task,
+from stub_common import (header_fields, is_scheduler_delivery, reply_task,
                          send_ready, wait_daemon, wait_for_task)
 
 ws = os.path.realpath(sys.argv[1])
@@ -29,7 +29,7 @@ send_ready(ws, handle)
 
 text = wait_for_task(
     ws,
-    lambda t, m: t.startswith("---swarm") and not t.startswith("---swarm-ctl") and marker in t,
+    lambda t, m: is_scheduler_delivery(t) and marker in t,
 )
 if not text:
     print("TIMEOUT waiting for parent task", flush=True)

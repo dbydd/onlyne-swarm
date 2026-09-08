@@ -8,8 +8,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from stub_common import (header_fields, reply_task, send_ready, wait_daemon,
-                         wait_for_task)
+from stub_common import (header_fields, is_scheduler_delivery, reply_task,
+                         send_ready, wait_daemon, wait_for_task)
 
 ws = os.path.realpath(sys.argv[1])
 tree_path = sys.argv[2]
@@ -21,7 +21,7 @@ send_ready(ws, handle)
 
 text = wait_for_task(
     ws,
-    lambda t, m: f"swarm-child-{marker}" in t,
+    lambda t, m: is_scheduler_delivery(t) and f"swarm-child-{marker}" in t,
 )
 if not text:
     print("TIMEOUT waiting for child task", flush=True)

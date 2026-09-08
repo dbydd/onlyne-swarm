@@ -61,6 +61,16 @@ def fetch_loopback(ws, limit=20):
     return r.get("data") or []
 
 
+def is_scheduler_delivery(text):
+    """True for the scheduler's second delivery, never raw relay or out."""
+    if not text.startswith("---swarm\n"):
+        return False
+    head, sep, _ = text.partition("\n---")
+    return bool(sep) and any(
+        line.strip() == "delivery: scheduler" for line in head.split("\n")
+    )
+
+
 def header_fields(text):
     """Parse a ---swarm header. Returns (task_id, transfer_send_to) or (None, None)."""
     task_id = None
