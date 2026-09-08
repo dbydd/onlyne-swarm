@@ -83,9 +83,11 @@ pub fn render(header: &SwarmHeader, role: &str, payload_markdown: &str) -> Strin
     s.push_str(&format!("from: {}\n", header.from));
     s.push_str(&format!("transfer_send_to: {}\n", header.transfer_send_to));
     s.push_str(&format!("attempt: {}\n", header.attempt));
+    // This renderer belongs to scheduler's second delivery step. Raw
+    // swarm_send/out wires use pi-onlyne's renderer and carry no delivery tag.
+    s.push_str("delivery: scheduler\n");
     s.push_str("---\n");
-    // Flat role block: plain numbered steps, no duplicate echo (the old
-    // `## role:` header + full echo confused claim parsing on cold start).
+    // Flat role text follows the delimiter once, with no duplicate echo.
     if !role.is_empty() {
         s.push_str(role);
         if !role.ends_with('\n') {
@@ -130,6 +132,7 @@ mod tests {
             attempt: 1,
         };
         let text = render(&h, "planner role", "do X");
+        assert!(text.contains("delivery: scheduler\n"));
         let m = parse(&text).unwrap();
         assert_eq!(m.header, h);
         assert!(m.payload.contains("do X"));

@@ -14,6 +14,7 @@ task_id: 550e8400-e29b-41d1-a716-446655440000
 from: planner
 transfer_send_to: 11111111-2222-3333-4444-555555555555
 attempt: 1
+delivery: scheduler
 ---
 ## role: planner
 
@@ -21,14 +22,16 @@ attempt: 1
 ```
 
 - 首行必须恰为 `---swarm`，末分隔行必须恰为 `---`。
-- 头部为 YAML 映射，四字段必填：
+- 头部为 YAML 映射，四字段必填，并可带 scheduler 交付标记：
   - `task_id`：UUID v4，调度器在 submit 与 in 监听入口生成。复用为 session id。
     swarm.db 内唯一索引，重复投递直接丢弃并记日志。
   - `from`：发起方树相对路径，root 为 `.`（如 `planner`、`a/b`）。
   - `transfer_send_to`：生成本任务的那个 task_id。顶层任务为空字符串或缺省。
   - `attempt`：整数，首次为 1。调度器不重放，attempt 主要用于 out 去重与 TUI 展示。
-- 分隔行之后为 Markdown 载荷。调度器投递时在载荷前前置 `## role: <name>` 段
-  （role 文取自合并后的模板 `role` 字段）。
+  - `delivery: scheduler`：调度器二次投递的结构标记。pi-onlyne 只凭此字段 claim；
+    raw relay 和 out wire 不带此字段。
+- 分隔行之后为 Markdown 载荷。调度器将合并后的模板 `role` 原文置于载荷前部一次；
+  role 可为任意 Markdown 或 prose。
 - 旧 `reply_to` 头不再识别：带 `reply_to` 的消息按头解析失败处理（普通消息）。
 
 ## 2. 解析规则
@@ -38,13 +41,14 @@ attempt: 1
 3. 头部 YAML 解析失败或缺必填字段 → 解析失败，按普通消息处理，并在 daemon 日志记 `warn`。
 4. `task_id` 非法（非 UUID）→ 按普通消息处理。
 5. 带旧 `reply_to` 字段 → 按普通消息处理（新旧字段名互不识别）。
-6. 头解析成功 → swarm 任务消息，进入优先级链（见 SPEC §5）。
+6. 含 `delivery: scheduler` 的二次投递 wire 可由 pi-onlyne claim；缺少该字段的
+   raw relay 先由 scheduler 建任务行，再转为二次投递。
 
 ## 3. out 格式
 
 目标 session 经 out 写出结果时，正文同样携带 swarm 头：`task_id` 为本任务 id，
 `from` 为本 workspace 路径，`transfer_send_to` 原值返回，`attempt` 原值返回。
-out 即成功信号（done），调度器记台账并回收 terminal，不做任何转发。
+out 不带 `delivery` 字段。out 即成功信号（done），调度器记台账并回收 terminal，不做任何转发。
 
 失败与取消不写消息体：早停记 failed 台账行，cancel 记 cancelled 台账行。
 `swarm-failed:` / `swarm-cancelled:` 前缀只出现在 ledger `reason` 字段。
@@ -81,9 +85,8 @@ task_id: aaaabbbb-cccc-dddd-eeee-ffffffffffff
 from: .
 transfer_send_to:
 attempt: 1
+delivery: scheduler
 ---
-## role: planner
-
 请产出三阶段拆解。
 ```
 
@@ -96,8 +99,6 @@ from: planner
 transfer_send_to: aaaabbbb-cccc-dddd-eeee-ffffffffffff
 attempt: 1
 ---
-## role: reviewer
-
 请评审上述拆解。
 ```
 
