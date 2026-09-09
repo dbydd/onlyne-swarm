@@ -639,6 +639,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "json5",
+ "libc",
  "ratatui",
  "rusqlite",
  "serde",

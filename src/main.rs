@@ -35,12 +35,19 @@ enum Cmd {
     Init,
     /// Write or refresh the supervisor skill at .agents/skills/onlyne-swarm/SKILL.md
     ExportSkill,
-    /// Start the scheduler in the foreground (cwd is the swarm root; syncs .schedule first)
+    /// Start the scheduler (cwd is the swarm root; syncs .schedule first)
     Run {
         /// Bypass the ancestor-marker check (allows nested starts)
         #[arg(long)]
         force: bool,
+        /// R4: run detached (double-fork + setsid); logs to .onlyne/logs,
+        /// pid to .onlyne/run/scheduler.pid. Ctrl-C on the launching shell
+        /// does not stop the ring; use `stop`.
+        #[arg(long)]
+        detach: bool,
     },
+    /// R4: stop a detached scheduler (SIGTERM, then SIGKILL after 5s)
+    Stop,
     /// Show status from an already-running scheduler
     Attach,
     /// Submit a Markdown payload file as a task to a workspace
@@ -121,9 +128,18 @@ async fn main() -> anyhow::Result<()> {
             println!("exported skill {}", path.display());
             Ok(())
         }
-        Cmd::Run { force } => {
+        Cmd::Run { force, detach } => {
             let cwd = std::env::current_dir()?;
             let root_p = root::ensure_root(&cwd, force)?;
+            if detach {
+                // R4: re-exec ourselves detached (child carries the
+                // already-resolved root so the guard runs once). The parent
+                // prints and returns; the child continues into the sync +
+                // serve path below with SWARM_DETACHED_CHILD set.
+                if std::env::var_os("ONLYNE_SWARM_DETACHED_CHILD").is_none() {
+                    return launch_detached(&root_p);
+                }
+            }
             let report = sync::run_sync(&root_p)?;
             println!("sync: +{} created, {} orphans, {} dangling links",
                 report.created.len(), report.orphans.len(), report.dangling.len());
@@ -138,18 +154,33 @@ async fn main() -> anyhow::Result<()> {
             }
             let _db = db::Db::open(&root_p)?;
             let mut children = daemon::ensure_all(&root_p)?;
-            println!("onlyne-swarm scheduler running at {}", root_p.display());
-            // R5.4: the scheduler is a foreground process sharing this pane's
-            // lifetime. Say so once: two rings have died to a stray Ctrl-C
-            // in a shared pane already. (--detach waits for the 0.7.0
-            // process-model redesign alongside the R4 state machine.)
-            println!(
-                "foreground scheduler in this pane; keep it exclusive — Ctrl-C here stops the ring"
-            );
+            // R4: a detached scheduler owns its pid file; foreground leaves
+            // no pid (Ctrl-C in the pane is the stop). The pid is what
+            // `stop` and a stale-file `status` read.
+            let detached = std::env::var_os("ONLYNE_SWARM_DETACHED_CHILD").is_some();
+            if detached {
+                if let Some(p) = root::swarm_pid(&root_p).parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                let _ = std::fs::write(root::swarm_pid(&root_p), format!("{}\n", std::process::id()));
+                println!("detached scheduler: pid {} log {}", std::process::id(), root::swarm_log(&root_p).display());
+            } else {
+                println!("onlyne-swarm scheduler running at {}", root_p.display());
+                // R5.4: the scheduler is a foreground process sharing this
+                // pane's lifetime. Say so once: two rings have died to a
+                // stray Ctrl-C in a shared pane already.
+                println!(
+                    "foreground scheduler in this pane; keep it exclusive — Ctrl-C here stops the ring"
+                );
+            }
             // serve() owns Ctrl-C/SIGTERM: it sets the Sched shutdown flag
             // (pump + reaper threads observe it and exit), then returns.
             // Only afterwards do we reap the managed daemons here.
-            ipc::serve(&root_p).await?;
+            let served = ipc::serve(&root_p).await;
+            if detached {
+                let _ = std::fs::remove_file(root::swarm_pid(&root_p));
+            }
+            served?;
             println!("shutting down; stopping managed daemons");
             daemon::stop_all(&mut children).await;
             Ok(())
@@ -157,8 +188,38 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Attach | Cmd::Status => {
             let cwd = std::env::current_dir()?;
             let root_p = root::cwd_root(&cwd);
-            let v = orca::client_request(&root::swarm_sock(&root_p), serde_json::json!({"id": "cli", "op": "status"}))?;
-            println!("{}", serde_json::to_string_pretty(&v)?);
+            match orca::client_request(&root::swarm_sock(&root_p), serde_json::json!({"id": "cli", "op": "status"})) {
+                Ok(v) => {
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                    Ok(())
+                }
+                Err(e) => {
+                    // R4: no socket AND no live pid means nothing to attach
+                    // to. Report the real reason instead of a raw
+                    // ECONNREFUSED, so a leftover socket from a killed
+                    // scheduler is distinguishable from a clean stop.
+                    if !proc_alive(&root_p) {
+                        let _ = std::fs::remove_file(root::swarm_sock(&root_p));
+                        println!("no scheduler running (stale socket cleaned)");
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        }
+        Cmd::Stop => {
+            let cwd = std::env::current_dir()?;
+            let root_p = root::cwd_root(&cwd);
+            let pid_path = root::swarm_pid(&root_p);
+            let pid: i32 = match std::fs::read_to_string(&pid_path) {
+                Ok(s) => s.trim().parse().map_err(|_| anyhow::anyhow!("malformed pid file {}", pid_path.display()))?,
+                Err(_) => {
+                    println!("no detached scheduler pid at {}", pid_path.display());
+                    return Ok(());
+                }
+            };
+            stop_pid(&root_p, pid)?;
             Ok(())
         }
         Cmd::Submit { to, payload } => {
@@ -225,6 +286,105 @@ fn shell_completions(shell: CompletionShell) {
     }
 }
 
+/// R4: double-fork + setsid, then exec ourselves with the child sentinel so
+/// the grandchild re-enters main() already detached and continues the normal
+/// `run` path (sync + serve). stdout/stderr go to `.onlyne/logs/scheduler.log`,
+/// stdin to /dev/null. The launching shell prints and returns immediately.
+#[cfg(unix)]
+fn launch_detached(root_p: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
+    if let Some(p) = root::swarm_log(root_p).parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root::swarm_log(root_p))?;
+    let devnull = std::fs::OpenOptions::new().read(true).open("/dev/null")?;
+    // fork #1: the parent returns to the shell; the child becomes a session
+    // leader so no terminal signal (Ctrl-C/SIGHUP) reaches the grandchild.
+    // SAFETY: fork in a single-threaded moment before tokio's worker threads
+    // start (this runs at the top of main, before the runtime is driven).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        anyhow::bail!("fork failed: {}", std::io::Error::last_os_error());
+    }
+    if pid > 0 {
+        println!("scheduler detached (pid file {}); follow {}", root::swarm_pid(root_p).display(), root::swarm_log(root_p).display());
+        return Ok(());
+    }
+    // Child: new session, then fork #2 so the session leader can exit and the
+    // grandchild is reparented to init (never a controlling-terminal holder).
+    unsafe {
+        libc::setsid();
+        let pid2 = libc::fork();
+        if pid2 < 0 {
+            libc::_exit(1);
+        }
+        if pid2 > 0 {
+            libc::_exit(0);
+        }
+    }
+    let exe = std::env::current_exe()?;
+    let err = std::process::Command::new(exe)
+        .arg("run")
+        .env("ONLYNE_SWARM_DETACHED_CHILD", "1")
+        .current_dir(root_p)
+        .stdin(std::process::Stdio::from(devnull))
+        .stdout(std::process::Stdio::from(log.try_clone()?))
+        .stderr(std::process::Stdio::from(log))
+        .exec();
+    // exec only returns on failure.
+    Err(anyhow::anyhow!("exec detached scheduler failed: {err}"))
+}
+
+#[cfg(not(unix))]
+fn launch_detached(_root_p: &std::path::Path) -> anyhow::Result<()> {
+    anyhow::bail!("--detach is unix-only in this build")
+}
+
+/// True when the pid file names a live process. A missing or stale file is
+/// `false` — the same answer for "never detached" and "crashed", which is
+/// what `status`/`stop` need (adoption itself probes terminals, not pids).
+fn proc_alive(root_p: &std::path::Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(root::swarm_pid(root_p)) else {
+        return false;
+    };
+    let Ok(pid) = raw.trim().parse::<i32>() else {
+        return false;
+    };
+    // kill(pid, 0): 0 = alive (or a zombie we cannot see); EPERM = alive but
+    // not ours; ESRCH = gone.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// R4 `stop`: SIGTERM, wait up to 5s for the scheduler's own shutdown path
+/// (it unlinks its socket and pid), then SIGKILL. The pid file and socket are
+/// removed either way so the next `status` reports `no scheduler`.
+fn stop_pid(root_p: &std::path::Path, pid: i32) -> anyhow::Result<()> {
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            anyhow::bail!("kill {pid}: {err}");
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        eprintln!("scheduler {pid} ignored SIGTERM; sending SIGKILL");
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_file(root::swarm_pid(root_p));
+    let _ = std::fs::remove_file(root::swarm_sock(root_p));
+    println!("scheduler {pid} stopped");
+    Ok(())
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
@@ -259,6 +419,33 @@ mod cli_tests {
     fn zsh_completion_mentions_swarm() {
         let text = completion_text(Zsh);
         assert!(text.contains("#compdef onlyne-swarm"));
+    }
+
+    #[test]
+    fn detach_flag_and_stop_subcommand_exist() {
+        // R4 §7: `run --detach` and `stop` are the process-model surface.
+        let cmd = Cli::command();
+        assert!(cmd.get_subcommands().any(|sc| sc.get_name() == "stop"));
+        let run = cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "run")
+            .expect("run subcommand");
+        assert!(run.get_arguments().any(|a| a.get_long() == Some("detach")));
+    }
+
+    #[test]
+    fn proc_alive_false_for_missing_and_stale_pid() {
+        // A missing pid file and a dead pid both read as "no scheduler";
+        // that is what lets `status` print the clean message instead of
+        // an ECONNREFUSED from a leftover socket.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!proc_alive(dir.path()));
+        std::fs::create_dir_all(dir.path().join(".onlyne/run")).unwrap();
+        std::fs::write(root::swarm_pid(dir.path()), "999999999\n").unwrap();
+        assert!(!proc_alive(dir.path()));
+        // Our own pid is alive.
+        std::fs::write(root::swarm_pid(dir.path()), format!("{}\n", std::process::id())).unwrap();
+        assert!(proc_alive(dir.path()));
     }
 
     #[test]

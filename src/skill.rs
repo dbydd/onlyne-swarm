@@ -98,13 +98,23 @@ stay on the root unless the operator enables them there.
 
 ```bash
 ONLYNE_BIN=/path/to/onlyne onlyne-swarm run
+# or, to survive the launching shell:
+ONLYNE_BIN=/path/to/onlyne onlyne-swarm run --detach
+onlyne-swarm stop
 ```
 
-Give the scheduler its own exclusive pane: it is a foreground process and
-Ctrl-C there stops the whole ring (`foreground scheduler in this pane;
-keep it exclusive`). Never run it in a pane shared with other sessions,
+Give the scheduler its own exclusive pane: foreground `run` is a foreground
+process and Ctrl-C there stops the whole ring (`foreground scheduler in this
+pane; keep it exclusive`). Never run it in a pane shared with other sessions,
 and never probe a production root (e.g. a live flywheel) with shutdown or
 reconcile tests — use a scratch root or `SWARM_STUB_AGENT=1`.
+
+`run --detach` double-forks + setsid, writes `.onlyne/run/scheduler.pid`,
+and logs to `.onlyne/logs/scheduler.log`; the launching shell returns
+immediately and Ctrl-C there is harmless. `stop` sends SIGTERM, waits up to
+5s for the scheduler's own shutdown (socket + pid unlinked), then SIGKILLs.
+`status` with no live pid reports `no scheduler running` and clears a stale
+socket. Adoption is unchanged: restart re-adopts live sessions either way.
 
 swarm-ready gates apply equally to root and every instance:
 `.onlyne/config.toml` has `[swarm] enabled = true`, `.pi/onlyne.json` has

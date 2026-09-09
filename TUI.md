@@ -58,6 +58,11 @@ ratatui 实现的 swarm.sock 客户端（2s 全量轮询 + 事件驱动刷新）
 - 标题行：`╭ <name> ●/○ ─╮`，`●` daemon 在线、`○` 离线（daemon 字段缺口见 §3.2）。
 - 活跃 session 行：`■ id8 running ◉` / `· id8 pending`。`◉` = 有真实 terminal
   （handle 非空且不以 `stub-` 开头）。
+- 活跃 session 行的符号按 hop 子状态细分（R4）：`busy` → `■`、`idle` → `◌`、
+  `dispatched`/`ready` → `…`；标签用 hop 子状态代替 `running`。旧数据或
+  hop 为空时回退到 `■ id8 running`。
+- busy hop 超过 role 的 `busy_secs` 上限时，该行标红（`hop_overlong`），
+  但不杀会话：红是给操作员的信号，回收权力仍只属 `cancel`。
 - 折叠行：终态按 role 聚合成一行 `+N done`（有 failed/cancelled 时追加计数）。
 - 空闲框保留一行 `(idle)`，框高最小 1，让边锚点的行号稳定。
 - 框高上限：`floor((栏可用高 - role数 × 3) / role数)`，最小 1 行，活跃 session 超出部分
@@ -72,9 +77,12 @@ ratatui 实现的 swarm.sock 客户端（2s 全量轮询 + 事件驱动刷新）
 |---|---|---|
 | 声明边 | `list_workspaces[].back_edges`（模板里归一化为树绝对路径） | 细虚线 `┄` |
 | 通信边 | `tasks` 的 distinct(`from_ws`, `to_ws`)，排除自环 | 粗实线 `━` |
+| 活跃边（R4） | 该 `(from_ws,to_ws)` 上当前有 `hop_state=busy` 的活跃 task | 粗实线 `━` + `Modifier::BOLD` + 绿色 |
 
 `tasks` 表没有清理逻辑，distinct 结果是全量通信史，所以粗线语义是"这对 role 之间
-传递过信息"。同一对 role 同时有声明与通信记录时取粗线。
+传递过信息"。同一对 role 同时有声明与通信记录时取粗线；有 busy hop 时升级为活跃边。
+活跃边的权重靠 ANSI bold 承担，笔画只表语义（CR4）：去色终端下 `━` 与通信边同形，
+bold 仍能区分"正在跑"与"跑过"。
 
 ### 2.4 布线场
 
@@ -84,7 +92,7 @@ ratatui 实现的 swarm.sock 客户端（2s 全量轮询 + 事件驱动刷新）
 - channel 分配：按跨度降序贪心占列；同列同格冲突时后来者外移一列；超出预算的边
   降级为目标框内的 `→ out: <target>` 文本行，线数增长不会毁掉图面。
 - 每帧重算行号。锚点是 role 名，role 行位置稳定，线的位置就稳定。
-- 栏底固定图例一行：`细 ┄=声明边　粗 ━=已发生通信　◉=活 tab`。
+- 栏底固定图例一行：`细 ┄=声明边　粗 ━=已发生通信　bold ━=活跃 hop　◉=活 tab`。
 
 ### 2.5 渲染与实现约束
 
@@ -159,7 +167,8 @@ ratatui 实现的 swarm.sock 客户端（2s 全量轮询 + 事件驱动刷新）
 {"data": {
   "task": {"task_id":"…","from_ws":".","to_ws":"scout","state":"running","attempt":1,
             "terminal":"orca:t-4417","created_at":1757000123,
-            "payload":"目标：…","out_head":"","reason":""},
+            "payload":"目标：…","out_head":"","reason":"","hop_state":"busy","ledger_state":""},
+  "hop": {"state":"busy","secs":95,"adopted":false},   // R4: 调度器内存时钟
   "parent":  {"task_id":"…","state":"done","out_head":"…"},
   "children":[{"task_id":"…","to_ws":"model","state":"pending","attempt":1}]
 }}
@@ -167,6 +176,9 @@ ratatui 实现的 swarm.sock 客户端（2s 全量轮询 + 事件驱动刷新）
 
 - 组成：`db.get(task_id)` 全列 + 父行（按 `transfer_send_to`）+ `db.family()` 的子节点。
   现成函数已盖住查询，缺的是一个拼三者的 op 分支与 `out_head`/`reason`/`created_at` 的 SELECT 列。
+- R4 新增 `hop`：`{state, secs, adopted}`。`secs` 来自调度器内存时钟
+  `hop_since`，重启清零；`adopted=true` 表示时钟起点是本次重启（收养），
+  detail 写 `hop busy for 1m35s (adopted)`，避免把重启后的 20 秒读成干活时长。
 - 触发时机：焦点栏选中行变化时拉一次。2s 轮询只刷列表与图；选中行仍在列表里时保留已有正文，
   正文拉取失败只写状态行，清掉旧正文会让画面闪烁。
 

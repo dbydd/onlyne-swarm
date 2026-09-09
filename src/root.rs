@@ -49,6 +49,17 @@ pub fn swarm_sock(root: &Path) -> PathBuf {
     root.join(".onlyne/run/swarm.sock")
 }
 
+/// R4 --detach: the scheduler pid file. `stop` reads it; a stale file (pid
+/// gone) is treated exactly like a missing one.
+pub fn swarm_pid(root: &Path) -> PathBuf {
+    root.join(".onlyne/run/scheduler.pid")
+}
+
+/// R4 --detach: stdout/stderr sink for the detached scheduler.
+pub fn swarm_log(root: &Path) -> PathBuf {
+    root.join(".onlyne/logs/scheduler.log")
+}
+
 /// Resolve an instance workspace dir from a tree-relative target ("a/b", "." = root itself).
 pub fn resolve_instance(root: &Path, target: &str) -> PathBuf {
     if target == "." || target.is_empty() {

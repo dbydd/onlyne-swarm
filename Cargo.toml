@@ -50,6 +50,8 @@ ratatui = "0.29"
 crossterm = "0.28"
 chrono = "0.4"
 signal-hook = "0.3"
+# R4 --detach: setsid for the double-fork. Already in the tree via signal-hook.
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
