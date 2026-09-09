@@ -3,6 +3,16 @@
 适用：把 `onlyne-swarm` 从 R4 之前的构建换到 0.7.0（hop 状态机），
 **不打断在途 hop**，并带 DB 迁移失败的回滚路径。
 
+R4 换代必须**三件同时换**：
+
+1. daemon `onlyne 0.6.0`：处理 `swarm_busy` / `swarm_idle` IPC op；
+2. scheduler `onlyne-swarm 0.7.0`：路由 busy/idle、维护 hop_state 与超时；
+3. plugin `pi-onlyne 0.9.0`：在 `agent_start` / `agent_end` 上报 busy/idle。
+
+只换 scheduler 会让 0.9.0 插件发出的 op 落到不识别它的 0.5.2 daemon，请求
+返回 unknown op，scheduler 收不到迁移事件；此时 hop 仍按旧 running 路径运行。
+因此三件任一不齐都不要开换代窗口。
+
 判据来源全部是代码事实，不靠记忆：
 
 - `cargo install --path` 只替换磁盘上的二进制文件；在跑的 scheduler 用旧
@@ -20,8 +30,11 @@
 ROOT=/path/to/swarm/root
 cd "$ROOT"
 sqlite3 .onlyne/swarm.db "PRAGMA table_info(tasks);" > /tmp/tasks-before.txt
-stat -f %Sm "$(command -v onlyne-swarm)" > /tmp/swarm-bin-before.txt   # macOS
-# Linux: stat -c %y "$(command -v onlyne-swarm)" > /tmp/swarm-bin-before.txt
+stat -f %Sm "$(command -v onlyne)" > /tmp/onlyne-bin-before.txt
+stat -f %Sm "$(command -v onlyne-swarm)" > /tmp/swarm-bin-before.txt
+# Linux: stat -c %y
+onlyne --version                  # 当前旧值期望 0.5.2
+onlyne-swarm --version            # 当前旧值期望 0.6.1
 onlyne-swarm status | jq '.data | {tasks_by_state, hops, alerts}' > /tmp/status-before.json
 onlyne-swarm list --state running
 onlyne-swarm list --state pending
@@ -30,16 +43,23 @@ onlyne-swarm list --state pending
 记下在途 task id。`status` 在 scheduler 活着时退出 0；**没有 scheduler 时它
 退出非零**（0.7.0 起），别把非零误读成故障。
 
-## 1. 装新二进制（不重启，不影响在途）
+## 1. 装三件新二进制（不重启，不影响在途）
 
 ```bash
 cd /path/to/onlyne
-cp "$(command -v onlyne-swarm)" /tmp/onlyne-swarm-0.6.1.bak   # 回滚用
+cp "$(command -v onlyne)" /tmp/onlyne-0.5.2.bak
+cp "$(command -v onlyne-swarm)" /tmp/onlyne-swarm-0.6.1.bak
+npm --prefix harness/pi-onlyne ci   # 或按现有本地安装方式装 pi-onlyne
+cargo install --path . --locked --offline
 cargo install --path harness/onlyne-swarm --locked --offline
-onlyne-swarm --version      # 期望 0.7.0
+
+onlyne --version                    # 期望 0.6.0
+onlyne-swarm --version              # 期望 0.7.0
+node -e 'const v=require("./harness/pi-onlyne/package.json").version; if(v!=="0.9.0")process.exit(1); console.log("pi-onlyne",v)'
 ```
 
 此步之后在跑的 scheduler 仍是旧构建；`--version` 反映磁盘，不反映进程。
+三件版本全部命中后才能进入第 2 节。
 
 ## 2. 选窗口
 
@@ -80,23 +100,31 @@ tail -f .onlyne/logs/scheduler.log
 
 ```bash
 sqlite3 .onlyne/swarm.db "PRAGMA table_info(tasks);" | grep hop_state   # 迁移生效
+onlyne --version                                                         # 必须 0.6.0
+onlyne-swarm --version                                                   # 必须 0.7.0
+node -e 'const v=require("/path/to/onlyne/harness/pi-onlyne/package.json").version; if(v!=="0.9.0")process.exit(1); console.log("pi-onlyne",v)'
 onlyne-swarm status | jq '.data | {tasks_by_state, hops, alerts}'       # hops 出现
 onlyne-swarm status | jq '.data.not_swarm_ready'                        # 应为 []
 ```
 
 对照第 0 步：在途 task 若走了收养，`ledger_state=adopted`、状态仍 `running`；
-若静默窗口重启，状态计数不变。
+若静默窗口重启，状态计数不变。三件版本任一不符即停止验收，先恢复三件旧产物。
 
 ## 5. 回滚
 
 ```bash
 onlyne-swarm stop    # 或 Ctrl-C 前台 pane
 cp /tmp/onlyne-swarm-0.6.1.bak "$(command -v onlyne-swarm)"
-onlyne-swarm --version      # 回到 0.6.1
+cp /tmp/onlyne-0.5.2.bak "$(command -v onlyne)"
+# 插件按安装方式恢复 0.8.1；若用仓库 checkout，回到 72e5fa6
+onlyne --version             # 回到 0.5.2
+onlyne-swarm --version       # 回到 0.6.1
 cd "$ROOT" && onlyne-swarm run
 ```
 
-**不需要回滚 DB。** 旧二进制忽略 `hop_state` 列。不要执行
+回滚同样三件同时回。0.9.0 插件可以接旧 daemon，只是 busy/idle op 被拒；旧
+插件不能接 0.7.0 scheduler 的新事件假设。因此插件、daemon、scheduler 的
+验收必须成组处理。**不需要回滚 DB。** 旧二进制忽略 `hop_state` 列。不要执行
 `ALTER TABLE tasks DROP COLUMN hop_state`：无必要，且删列会重写表、在
 有 scheduler 时加锁。
 
@@ -107,5 +135,7 @@ cd "$ROOT" && onlyne-swarm run
   测试树下的 scheduler（`kill_tree_schedulers`），但 `build` 步骤重，且
   多场景会反复起停，没必要冒险。
 - `onlyne-swarm status` 的退出码是探活判据；无 scheduler 时非零。
-- 记录换代前后的 `pragma table_info(tasks)` 与 `stat` 二进制 mtime：
-  `--version` 现已能区分（0.6.1 → 0.7.0），这两份是二次佐证。
+- 换代验收固定三行：`onlyne --version` = `0.6.0`、
+  `onlyne-swarm --version` = `0.7.0`、pi-onlyne `package.json.version` = `0.9.0`。
+- 记录换代前后的 `pragma table_info(tasks)`、`onlyne` 二进制 mtime 与
+  `onlyne-swarm` 二进制 mtime；三件版本号共同构成换代指纹。
