@@ -7,9 +7,10 @@ R4 换代必须**三件同时换**：
 
 1. daemon `onlyne 0.6.0`：处理 `swarm_busy` / `swarm_idle` IPC op；
 2. scheduler `onlyne-swarm 0.7.0`：路由 busy/idle、维护 hop_state 与超时；
-3. plugin `pi-onlyne 0.9.0`：在 `agent_start` / `agent_end` 上报 busy/idle。
+3. plugin `pi-onlyne 0.9.1`：在 `agent_start` / `agent_end` 上报 busy/idle，
+   且将 `ONLYNE_SWARM_TASK` 作为 history replay 硬绑定；
 
-只换 scheduler 会让 0.9.0 插件发出的 op 落到不识别它的 0.5.2 daemon，请求
+只换 scheduler 会让 0.9.1 插件发出的 op 落到不识别它的 0.5.2 daemon，请求
 返回 unknown op，scheduler 收不到迁移事件；此时 hop 仍按旧 running 路径运行。
 因此三件任一不齐都不要开换代窗口。
 
@@ -55,7 +56,7 @@ cargo install --path harness/onlyne-swarm --locked --offline
 
 onlyne --version                    # 期望 0.6.0
 onlyne-swarm --version              # 期望 0.7.0
-node -e 'const v=require("./harness/pi-onlyne/package.json").version; if(v!=="0.9.0")process.exit(1); console.log("pi-onlyne",v)'
+node -e 'const v=require("./harness/pi-onlyne/package.json").version; if(v!=="0.9.1")process.exit(1); console.log("pi-onlyne",v)'
 ```
 
 此步之后在跑的 scheduler 仍是旧构建；`--version` 反映磁盘，不反映进程。
@@ -102,7 +103,7 @@ tail -f .onlyne/logs/scheduler.log
 sqlite3 .onlyne/swarm.db "PRAGMA table_info(tasks);" | grep hop_state   # 迁移生效
 onlyne --version                                                         # 必须 0.6.0
 onlyne-swarm --version                                                   # 必须 0.7.0
-node -e 'const v=require("/path/to/onlyne/harness/pi-onlyne/package.json").version; if(v!=="0.9.0")process.exit(1); console.log("pi-onlyne",v)'
+node -e 'const v=require("/path/to/onlyne/harness/pi-onlyne/package.json").version; if(v!=="0.9.1")process.exit(1); console.log("pi-onlyne",v)'
 onlyne-swarm status | jq '.data | {tasks_by_state, hops, alerts}'       # hops 出现
 onlyne-swarm status | jq '.data.not_swarm_ready'                        # 应为 []
 # 语义 smoke：scratch root 提交一个正文首行 `> hop-failed:` 的 out，
@@ -125,7 +126,7 @@ onlyne-swarm --version       # 回到 0.6.1
 cd "$ROOT" && onlyne-swarm run
 ```
 
-回滚同样三件同时回。0.9.0 插件可以接旧 daemon，只是 busy/idle op 被拒；旧
+回滚同样三件同时回。0.9.1 插件可以接旧 daemon，只是 busy/idle op 被拒；旧
 插件不能接 0.7.0 scheduler 的新事件假设。因此插件、daemon、scheduler 的
 验收必须成组处理。**不需要回滚 DB。** 旧二进制忽略 `hop_state` 列。不要执行
 `ALTER TABLE tasks DROP COLUMN hop_state`：无必要，且删列会重写表、在
@@ -139,6 +140,9 @@ cd "$ROOT" && onlyne-swarm run
   多场景会反复起停，没必要冒险。
 - `onlyne-swarm status` 的退出码是探活判据；无 scheduler 时非零。
 - 换代验收固定三行：`onlyne --version` = `0.6.0`、
-  `onlyne-swarm --version` = `0.7.0`、pi-onlyne `package.json.version` = `0.9.0`。
+  `onlyne-swarm --version` = `0.7.0`、pi-onlyne `package.json.version` = `0.9.1`。
+- `pi-onlyne 0.9.1` 额外 smoke：新 pane 的 `ONLYNE_SWARM_TASK` 与
+  第一条 custom message 的 swarm header task_id 必须相同；任务尚未入 history 时
+  session 应等待 live delivery，绝不回放 workspace 内旧 payload。
 - 记录换代前后的 `pragma table_info(tasks)`、`onlyne` 二进制 mtime 与
   `onlyne-swarm` 二进制 mtime；三件版本号共同构成换代指纹。
