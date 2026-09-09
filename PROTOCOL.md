@@ -48,10 +48,18 @@ delivery: scheduler
 
 目标 session 经 out 写出结果时，正文同样携带 swarm 头：`task_id` 为本任务 id，
 `from` 为本 workspace 路径，`transfer_send_to` 原值返回，`attempt` 原值返回。
-out 不带 `delivery` 字段。out 即成功信号（done），调度器记台账并回收 terminal，不做任何转发。
+out 不带 `delivery` 字段。out 是**终态 handoff 信号**：调度器保留正文前 200 字
+到 `out_head`，记台账并回收 terminal，不做任何转发。
 
-失败与取消不写消息体：早停记 failed 台账行，cancel 记 cancelled 台账行。
-`swarm-failed:` / `swarm-cancelled:` 前缀只出现在 ledger `reason` 字段。
+正文第一个非空行是 `> hop-failed:` 时，out 是**失败 handoff**：调度器记
+`state=failed`、`ledger_state=failed`、`reason=swarm-failed: handoff declares
+hop-failed`，同时保留 `out_head` 供下游读取现场。任何其他 out 是成功 handoff：
+记 done ledger，回收后 DB 行为 closed。该 marker 只在第一个非空行生效，后文引用
+`> hop-failed:` 不改变成功语义。
+
+`swarm_quit` 不写 out，只上行 `swarm_recycled` 的 `quit:<reason>`，调度器记 failed。
+早停同样记 failed；cancel 记 cancelled。`swarm-failed:` / `swarm-cancelled:`
+前缀可出现在 ledger `reason` 字段。
 
 ## 3b. 回收控制线（`---swarm-ctl`）
 

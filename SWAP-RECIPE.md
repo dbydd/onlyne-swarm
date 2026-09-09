@@ -105,6 +105,9 @@ onlyne-swarm --version                                                   # 必�
 node -e 'const v=require("/path/to/onlyne/harness/pi-onlyne/package.json").version; if(v!=="0.9.0")process.exit(1); console.log("pi-onlyne",v)'
 onlyne-swarm status | jq '.data | {tasks_by_state, hops, alerts}'       # hops 出现
 onlyne-swarm status | jq '.data.not_swarm_ready'                        # 应为 []
+# 语义 smoke：scratch root 提交一个正文首行 `> hop-failed:` 的 out，
+# 期望 DB state/ledger_state 都是 failed 且 out_head 保留该正文；
+# 后文才出现 marker 的正常 out 仍应是 done/closed。
 ```
 
 对照第 0 步：在途 task 若走了收养，`ledger_state=adopted`、状态仍 `running`；

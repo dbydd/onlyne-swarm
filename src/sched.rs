@@ -459,9 +459,22 @@ fn write_loopback_in(ws: &std::path::Path, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A handoff that starts with the canonical failure marker carries useful
+/// evidence for downstream roles, yet is an explicitly non-success terminal
+/// outcome. Role contracts use this exact first non-empty line when a task
+/// premise is stale or a required proof/evaluation failed.
+fn failed_handoff(payload: &str) -> bool {
+    payload
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim_start().starts_with("> hop-failed:"))
+        .unwrap_or(false)
+}
+
 /// Called when an out message with a swarm header is observed on a workspace.
-/// Fire-and-forget: mark done, append the ledger row, recycle the terminal.
-/// No callback forwarding, no parent bookkeeping, no supervisor notify.
+/// Fire-and-forget: preserve the handoff evidence, record done or failed, then
+/// recycle the terminal. No callback forwarding, no parent bookkeeping, no
+/// supervisor notify.
 pub fn on_out(
     sched: &Arc<Sched>,
     from_ws: &str,
@@ -492,9 +505,21 @@ pub fn on_out(
         }
         _ => {}
     }
-    sched.db.set_state(task_id, crate::db::TaskState::Done)?;
     let out_head: String = msg.payload.chars().take(200).collect();
-    sched.db.set_ledger(task_id, "done", &out_head, "")?;
+    let failed = failed_handoff(&msg.payload);
+    let terminal_state = if failed {
+        crate::db::TaskState::Failed
+    } else {
+        crate::db::TaskState::Done
+    };
+    let ledger_state = if failed { "failed" } else { "done" };
+    let reason = if failed {
+        "swarm-failed: handoff declares hop-failed"
+    } else {
+        ""
+    };
+    sched.db.set_state(task_id, terminal_state)?;
+    sched.db.set_ledger(task_id, ledger_state, &out_head, reason)?;
     crate::db::append_ledger_line(
         &sched.root,
         &crate::db::LedgerEvent {
@@ -502,18 +527,27 @@ pub fn on_out(
             transfer_send_to: task.transfer_send_to.clone(),
             from_ws: from_ws.into(),
             to_ws: task.to_ws.clone(),
-            state: "done".into(),
+            state: ledger_state.into(),
             out_head,
-            reason: String::new(),
+            reason: reason.into(),
         },
     );
-    sched.emit(
-        "task_done",
-        serde_json::json!({"task_id": task_id, "from": from_ws}),
-    );
+    if failed {
+        sched.emit(
+            "task_failed",
+            serde_json::json!({"task_id": task_id, "from": from_ws, "reason": reason}),
+        );
+    } else {
+        sched.emit(
+            "task_done",
+            serde_json::json!({"task_id": task_id, "from": from_ws}),
+        );
+    }
     close_terminal(sched, task_id)?;
-    sched.db.set_state(task_id, crate::db::TaskState::Closed)?;
-    sched.emit("task_closed", serde_json::json!({"task_id": task_id}));
+    if !failed {
+        sched.db.set_state(task_id, crate::db::TaskState::Closed)?;
+        sched.emit("task_closed", serde_json::json!({"task_id": task_id}));
+    }
     Ok(())
 }
 
@@ -822,6 +856,38 @@ mod sched_tests {
         let tail = s.db.ledger(10).unwrap();
         assert_eq!(tail.len(), 1);
         assert_eq!(tail[0].state, "done");
+    }
+
+    #[test]
+    fn failed_handoff_marker_records_failed_and_keeps_evidence() {
+        // ARIS ops-110 regression: an agent may hand over an explanation
+        // whose contract says the hop failed. Preserve the out head for the
+        // next role, yet never publish it as a successful done/closed hop.
+        let s = test_sched();
+        seed(&s, "fh1", "writer", "", TaskState::Running);
+        let payload = "> hop-failed: task premise is stale\n\nNo files were written.";
+        on_out(&s, "writer", &reply_msg("fh1", "", payload)).unwrap();
+        let task = s.db.get("fh1").unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Failed);
+        assert_eq!(task.ledger_state, "failed");
+        assert!(task.out_head.starts_with("> hop-failed:"));
+        assert!(task.reason.contains("handoff declares hop-failed"));
+        let tail = s.db.ledger(10).unwrap();
+        assert!(tail.iter().any(|row| row.task_id == "fh1" && row.state == "failed"));
+    }
+
+    #[test]
+    fn marker_later_in_normal_handoff_does_not_change_success() {
+        // The marker is a first non-empty-line protocol token. Quoting it
+        // later in an otherwise successful report must remain a done/closed
+        // handoff, so prose cannot accidentally change control semantics.
+        let s = test_sched();
+        seed(&s, "fh2", "writer", "", TaskState::Running);
+        let payload = "Report completed.\n\nPrior attempt said: > hop-failed: stale";
+        on_out(&s, "writer", &reply_msg("fh2", "", payload)).unwrap();
+        let task = s.db.get("fh2").unwrap().unwrap();
+        assert_eq!(task.state, TaskState::Closed);
+        assert_eq!(task.ledger_state, "done");
     }
 
     #[test]
