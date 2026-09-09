@@ -187,6 +187,13 @@ pub enum GraphLineKind {
     Selected,
     Failed,
     Alert,
+    /// R4: lifecycle notices (adopted) — bold, default color. Distinct from
+    /// Alert (red) so routine adoption never reads as a fault.
+    Notice,
+    /// R4 (CR4): hop-active rail edge. Weight carried by Modifier::BOLD
+    /// (stroke alone only encodes semantics), so a busy edge stays
+    /// distinguishable on de-colored terminals.
+    HopActive,
     Legend,
 }
 
@@ -195,6 +202,10 @@ pub struct GraphLine {
     pub text: String,
     pub kind: GraphLineKind,
     pub task_id: Option<String>,
+    /// R4: per-character style overrides (e.g. HopActive rail cells) for
+    /// cells on this line. `None` entries inherit `kind`. Same length as
+    /// `text` after trimming.
+    pub overrides: Vec<Option<GraphLineKind>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -202,6 +213,10 @@ pub struct GraphLayout {
     pub lines: Vec<GraphLine>,
     pub task_ids: Vec<String>,
 }
+
+/// R4: alert text stays a stable wire-like string. `alert_kind` classifies
+/// routine adoption versus red dropped-out entries at render time.
+pub type AlertLine = String;
 
 #[derive(Clone, Debug)]
 struct RoleNode {
@@ -215,6 +230,8 @@ struct RoleNode {
 enum EdgeKind {
     Declared,
     Communicated,
+    /// R4: edge currently hosting a busy hop.
+    HopActive,
 }
 
 #[derive(Clone, Debug)]
@@ -415,6 +432,22 @@ fn pull(sock: &Path, filter: &HistoryFilter, page_size: usize) -> Snapshot {
     .0;
     let history_request = history_request(filter, page_size);
     let (history, history_total) = request_page(sock, history_request);
+    // R4: merge the live hop clock into each active row so the graph colors
+    // an overlong busy hop red (design §4) without threading a side map
+    // through every layout helper.
+    let hops = status.get("hops").cloned().unwrap_or(serde_json::Value::Null);
+    let active_tasks: Vec<serde_json::Value> = active_tasks
+        .into_iter()
+        .map(|mut task| {
+            let id = task_id(&task).map(str::to_owned);
+            if let (Some(id), Some(obj)) = (id, task.as_object_mut()) {
+                if let Some(hop) = hops.get(id) {
+                    obj.insert("hop".into(), hop.clone());
+                }
+            }
+            task
+        })
+        .collect();
     Snapshot {
         status,
         workspaces,
@@ -502,8 +535,8 @@ fn sync_selection_and_detail(
     ) {
         Ok(value) => {
             if let Some(data) = value.get("data") {
-                state.detail = Some(data.clone());
-            }
+            state.detail = Some(data.clone());
+        }
         }
         Err(error) => state.message = format!("detail failed: {error}"),
     }
@@ -761,7 +794,22 @@ fn render_graph(frame: &mut ratatui::Frame, area: Rect, snapshot: &Snapshot, sta
     let lines: Vec<Line> = layout
         .lines
         .iter()
-        .map(|line| Line::from(Span::styled(line.text.clone(), graph_style(line.kind))))
+        .map(|line| {
+            let spans = line
+                .text
+                .chars()
+                .enumerate()
+                .map(|(index, ch)| {
+                    let kind = line
+                        .overrides
+                        .get(index)
+                        .and_then(|kind| *kind)
+                        .unwrap_or(line.kind);
+                    Span::styled(ch.to_string(), graph_style(kind))
+                })
+                .collect::<Vec<_>>();
+            Line::from(spans)
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(
@@ -874,12 +922,26 @@ fn render_detail(frame: &mut ratatui::Frame, area: Rect, state: &UiState) {
 }
 
 fn render_keys(frame: &mut ratatui::Frame, area: Rect, state: &UiState) {
+    // R4: compact selected-hop dwell in the status bar, so the operator
+    // sees how long the current hop has sat in its substate without
+    // opening the detail pane. Adoption shows as `*` (clock from restart).
+    let hop_tag = state
+        .detail
+        .as_ref()
+        .and_then(|detail| detail.get("hop"))
+        .and_then(|hop| {
+            let state = hop.get("state")?.as_str()?;
+            let secs = hop.get("secs")?.as_u64()?;
+            let mark = if hop.get("adopted").and_then(|v| v.as_bool()).unwrap_or(false) { "*" } else { "" };
+            Some(format!("   hop {state} {}{mark}", format_secs(secs)))
+        })
+        .unwrap_or_default();
     let status = if let Some(search) = &state.search {
         format!("search: {search}  [Enter] apply  [Esc] discard")
     } else {
         format!(
-            "[Tab] graph↔history  [↑↓/jk] move  [/] text  [s][r][e][w][x] filter  [J/K] detail  [f]ocus  [c]ancel  [t]oggle  [q]uit   {}",
-            state.message
+            "[Tab] graph↔history  [↑↓/jk] move  [/] text  [s][r][e][w][x] filter  [J/K] detail  [f]ocus  [c]ancel  [t]oggle  [q]uit   {message}{hop_tag}",
+            message = state.message
         )
     };
     frame.render_widget(
@@ -899,7 +961,7 @@ pub(crate) fn build_graph_layout(
     width: u16,
     height: u16,
     selected_id: Option<&str>,
-    alerts: &[String],
+    alerts: &[AlertLine],
 ) -> GraphLayout {
     let roles = role_nodes(workspaces);
     if roles.is_empty() || width < 12 || height < 4 {
@@ -908,6 +970,7 @@ pub(crate) fn build_graph_layout(
                 text: "(no roles)".into(),
                 kind: GraphLineKind::Normal,
                 task_id: None,
+                overrides: vec![],
             }],
             task_ids: vec![],
         };
@@ -929,6 +992,17 @@ pub(crate) fn build_graph_layout(
     let mut task_ids = vec![];
     let mut line_styles = BTreeMap::new();
     let mut task_for_line = BTreeMap::new();
+    let mut rail_cells = vec![];
+    let busy_pairs = active_tasks
+        .iter()
+        .filter(|task| task_string(task, "hop_state") == "busy")
+        .map(|task| {
+            (
+                task_string(task, "from_ws"),
+                task_string(task, "to_ws"),
+            )
+        })
+        .collect::<BTreeSet<_>>();
     let mut row_y = 0usize;
 
     for role in &roles {
@@ -969,7 +1043,8 @@ pub(crate) fn build_graph_layout(
         &mut canvas,
         frame_width,
         &anchors,
-        combined_edges(&roles, graph),
+        combined_edges(&roles, graph, &busy_pairs),
+        &mut rail_cells,
     );
 
     let mut lines = vec![];
@@ -980,22 +1055,33 @@ pub(crate) fn build_graph_layout(
             .get(&row)
             .copied()
             .unwrap_or(GraphLineKind::Normal);
+        let mut overrides = vec![None; text.chars().count()];
+        for (cell_row, cell_col, style) in rail_cells.iter().copied() {
+            if cell_row == row {
+                if let Some(slot) = overrides.get_mut(cell_col) {
+                    *slot = style;
+                }
+            }
+        }
         lines.push(GraphLine {
             text,
             kind,
             task_id,
+            overrides,
         });
     }
     lines.push(GraphLine {
-        text: "┄ declared edge   ━ communication observed   ◉ live tab".into(),
+        text: "┄ declared edge   ━ communication observed   ━ hop active   ◉ live tab".into(),
         kind: GraphLineKind::Legend,
         task_id: None,
+        overrides: vec![],
     });
     for alert in alerts.iter().take(alert_rows) {
         lines.push(GraphLine {
             text: format!("! {alert}"),
-            kind: GraphLineKind::Alert,
+            kind: alert_kind(alert),
             task_id: None,
+            overrides: vec![],
         });
     }
     GraphLayout { lines, task_ids }
@@ -1050,7 +1136,15 @@ fn role_body(
         .map(|task| RoleBodyLine {
             text: graph_task_text(task, selected_id == task_id(task)),
             task_id: task_id(task).map(str::to_owned),
-            failed: task_string(task, "state") == "failed",
+            // R4: a failed row is red; so is a busy hop past its role cap
+            // (hop_overlong), which stays alive — the color is a signal for
+            // the operator, never a kill (design §4, CR6).
+            failed: task_string(task, "state") == "failed"
+                || task
+                    .get("hop")
+                    .and_then(|h| h.get("overlong"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
         })
         .collect();
     let hidden = sessions.len().saturating_sub(lines.len());
@@ -1160,7 +1254,15 @@ fn terminal_summary(counts: &BTreeMap<(String, String), i64>, workspace: &str) -
     parts.join(" ")
 }
 
-fn combined_edges(roles: &[RoleNode], graph: &serde_json::Value) -> Vec<EdgeSpec> {
+/// R4: promote an edge to HopActive when a busy hop currently runs on it.
+/// `busy_pairs` is (from_ws, to_ws) per busy active task. Declared-only
+/// edges stay thin; communicated history stays default weight; only live
+/// work takes the bold rail (CR4).
+fn combined_edges(
+    roles: &[RoleNode],
+    graph: &serde_json::Value,
+    busy_pairs: &BTreeSet<(String, String)>,
+) -> Vec<EdgeSpec> {
     let known: BTreeSet<&str> = roles.iter().map(|role| role.path.as_str()).collect();
     let mut combined: BTreeMap<(String, String), EdgeKind> = BTreeMap::new();
     for role in roles {
@@ -1188,7 +1290,16 @@ fn combined_edges(roles: &[RoleNode], graph: &serde_json::Value) -> Vec<EdgeSpec
     }
     combined
         .into_iter()
-        .map(|((from, to), kind)| EdgeSpec { from, to, kind })
+        .map(|((from, to), kind)| {
+            let kind = if kind == EdgeKind::Communicated
+                && busy_pairs.contains(&(from.clone(), to.clone()))
+            {
+                EdgeKind::HopActive
+            } else {
+                kind
+            };
+            EdgeSpec { from, to, kind }
+        })
         .collect()
 }
 
@@ -1197,6 +1308,7 @@ fn route_edges(
     frame_width: usize,
     anchors: &BTreeMap<String, usize>,
     mut edges: Vec<EdgeSpec>,
+    rail_cells: &mut Vec<(usize, usize, Option<GraphLineKind>)>,
 ) {
     if frame_width >= canvas.first().map(Vec::len).unwrap_or(0) {
         return;
@@ -1229,10 +1341,15 @@ fn route_edges(
         let x = frame_width + channel;
         let stroke = match edge.kind {
             EdgeKind::Declared => '┄',
-            EdgeKind::Communicated => '━',
+            EdgeKind::Communicated | EdgeKind::HopActive => '━',
+        };
+        let rail_kind = match edge.kind {
+            EdgeKind::HopActive => Some(GraphLineKind::HopActive),
+            _ => None,
         };
         for row in low.saturating_add(1)..high {
             put_cell(canvas, row, x, stroke);
+            rail_cells.push((row, x, rail_kind));
         }
         put_cell(canvas, source, x, '╴');
         put_cell(canvas, target, x, '◀');
@@ -1260,7 +1377,17 @@ fn box_bottom(width: usize) -> String {
 fn graph_task_text(task: &serde_json::Value, selected: bool) -> String {
     let marker = if selected { "▶" } else { "·" };
     let state = task_string(task, "state");
-    let symbol = if state == "running" { "■" } else { "·" };
+    // R4: the hop substate refines the running symbol: busy works, idle
+    // waits, dispatched/ready are handshake intermediates.
+    let hop = task_string(task, "hop_state");
+    let symbol = match hop.as_str() {
+        "busy" => "■",
+        "idle" => "◌",
+        "dispatched" | "ready" => "…",
+        _ if state == "running" => "■",
+        _ => "·",
+    };
+    let label = if hop.is_empty() { state.as_str() } else { hop.as_str() };
     let handle = task_string(task, "terminal");
     let live = if !handle.is_empty() && !handle.starts_with("stub-") {
         " ◉"
@@ -1268,7 +1395,7 @@ fn graph_task_text(task: &serde_json::Value, selected: bool) -> String {
         ""
     };
     format!(
-        "{marker} {symbol} {} {state}{live}",
+        "{marker} {symbol} {} {label}{live}",
         short_id(task_id(task).unwrap_or("?"))
     )
 }
@@ -1293,11 +1420,27 @@ fn graph_style(kind: GraphLineKind) -> Style {
         GraphLineKind::Selected => Style::default().add_modifier(Modifier::REVERSED),
         GraphLineKind::Failed => Style::default().fg(Color::Red),
         GraphLineKind::Alert => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        GraphLineKind::Notice => Style::default().add_modifier(Modifier::BOLD),
+        GraphLineKind::HopActive => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
         GraphLineKind::Legend => Style::default().fg(Color::DarkGray),
     }
 }
 
-fn alerts(snapshot: &Snapshot) -> Vec<String> {
+/// R4: classify a status alert by content. Adoption is routine (Notice,
+/// bold default); dropped-out rows are real loss (Alert, red).
+fn alert_kind(text: &str) -> GraphLineKind {
+    if text.starts_with("dropped-out:") {
+        GraphLineKind::Alert
+    } else if text.starts_with("adopted:") {
+        GraphLineKind::Notice
+    } else {
+        GraphLineKind::Alert
+    }
+}
+
+fn alerts(snapshot: &Snapshot) -> Vec<AlertLine> {
     let mut alerts = vec![];
     for orphan in snapshot
         .status
@@ -1322,6 +1465,16 @@ fn alerts(snapshot: &Snapshot) -> Vec<String> {
             "dangling-link: {}",
             dangling.as_str().unwrap_or("?")
         ));
+    }
+    for recent in snapshot
+        .status
+        .get("alerts")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let text = recent.as_str().unwrap_or("?").to_string();
+        alerts.push(text);
     }
     alerts
 }
@@ -1388,13 +1541,26 @@ pub(crate) fn detail_text(detail: &serde_json::Value) -> (String, String) {
         .get("created_at")
         .and_then(|value| value.as_i64())
         .unwrap_or(0);
+    // R4: live hop clock from task_detail. The adopted marker labels the
+    // dwell as "since this scheduler restart", never as the session age.
+    let hop_line = match detail.get("hop") {
+        Some(hop) if hop.is_object() => {
+            let state = hop.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+            let secs = hop.get("secs").and_then(|v| v.as_u64()).unwrap_or(0);
+            let adopted = hop.get("adopted").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mark = if adopted { " (adopted)" } else { "" };
+            format!("hop {state} for {}{mark}", format_secs(secs))
+        }
+        _ => "hop (none)".into(),
+    };
     let body = format!(
-        "{} → {}   {}   attempt {}   {}\n\nterminal: {}  {}\nparent: {}\nchildren: {}\n\npayload\n{}\n\nout\n{}\n\nreason\n{}",
+        "{} → {}   {}   attempt {}   {}\n{}\n\nterminal: {}  {}\nparent: {}\nchildren: {}\n\npayload\n{}\n\nout\n{}\n\nreason\n{}",
         task_string(&task, "from_ws"),
         task_string(&task, "to_ws"),
         state,
         task.get("attempt").and_then(|value| value.as_u64()).unwrap_or(0),
         format_created(created),
+        hop_line,
         if terminal.is_empty() { "(none)" } else { &terminal },
         terminal_state,
         parent,
@@ -1404,6 +1570,14 @@ pub(crate) fn detail_text(detail: &serde_json::Value) -> (String, String) {
         if reason.is_empty() { "(empty)" } else { &reason },
     );
     (format!("session {}", short_id(id)), body)
+}
+
+fn format_secs(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
 }
 
 fn format_created(epoch: i64) -> String {
@@ -1573,6 +1747,44 @@ mod tests {
             .lines
             .iter()
             .any(|line| line.kind == GraphLineKind::Alert));
+    }
+
+    #[test]
+    fn hop_symbols_and_overlong_red_and_adopted_detail() {
+        // R4 §4: busy ■, idle ◌, dispatched … ; overlong busy colors the
+        // task line red; an adopted hop shows the (adopted) dwell marker.
+        let busy = serde_json::json!({"task_id":"bbbbbbbb-1","state":"running","hop_state":"busy","from_ws":".","to_ws":"a","terminal":"term-1"});
+        assert!(graph_task_text(&busy, false).contains('■'));
+        assert!(graph_task_text(&busy, false).contains("busy"));
+        let idle = serde_json::json!({"task_id":"iiiiiiii-1","state":"running","hop_state":"idle","from_ws":".","to_ws":"a"});
+        assert!(graph_task_text(&idle, false).contains('◌'));
+        let disp = serde_json::json!({"task_id":"dddddddd-1","state":"running","hop_state":"dispatched","from_ws":".","to_ws":"a"});
+        assert!(graph_task_text(&disp, false).contains('…'));
+        // overlong red: a hop object with overlong=true renders Failed.
+        let overlong = serde_json::json!({"task_id":"oooooooo-1","state":"running","hop_state":"busy","from_ws":".","to_ws":"a","hop":{"state":"busy","secs":9999,"overlong":true}});
+        let workspaces = vec![role(".", "root", "ready", &[]), role("a", "worker", "ready", &[])];
+        let layout = build_graph_layout(
+            &workspaces,
+            &[overlong],
+            &serde_json::json!({"by_ws":[],"edges":[]}),
+            60,
+            12,
+            None,
+            &[],
+        );
+        assert!(layout
+            .lines
+            .iter()
+            .any(|line| line.task_id.as_deref() == Some("oooooooo-1")
+                && line.kind == GraphLineKind::Failed));
+        // adopted detail marker
+        let detail = serde_json::json!({
+            "task": {"task_id":"aaaaaaaa-1234","from_ws":".","to_ws":"a","attempt":1,"state":"running","terminal":"","created_at":0,"payload":"p","out_head":"","reason":"","ledger_state":"adopted"},
+            "hop": {"state":"busy","secs":95,"adopted":true},
+            "parent": null, "children": []
+        });
+        let (_, body) = detail_text(&detail);
+        assert!(body.contains("hop busy for 1m35s (adopted)"), "{body}");
     }
 
     #[test]

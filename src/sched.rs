@@ -38,11 +38,23 @@ pub struct Sched {
     pub terminals: Mutex<HashMap<String, String>>,
     /// workspace path -> idle ready terminal handles (transient pool).
     pub idle: Mutex<HashMap<String, Vec<IdleTerminal>>>,
-    /// task_id -> time the terminal was created (ready-timeout tracking).
-    pub awaiting_ready: Mutex<HashMap<String, std::time::Instant>>,
     /// task_id -> successful FIFO delivery time. Dead-terminal detection waits
     /// a short grace window so an out event racing with process exit wins.
     pub running_since: Mutex<HashMap<String, std::time::Instant>>,
+    /// R4: task_id -> (hop_state, entered_at). Memory-only dwell clock for
+    /// TUI display; cleared on restart (pre-restart dwell is unknowable).
+    pub hop_since: Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// R4: task_id -> last hop_overlong emit. Drives the CR6 repeat policy.
+    pub overlong_last: Mutex<HashMap<String, std::time::Instant>>,
+    /// R4 (CR3): tasks idle while the hop still awaits `swarm_complete`.
+    /// The plugin owns the exit reminder and the auto-quit for these, so
+    /// the scheduler records + displays them and never fails them by TTL.
+    /// Idles without this flag are stale reports and do hit the TTL.
+    pub idle_pending_exit: Mutex<std::collections::HashSet<String>>,
+    /// R4: recent lifecycle alerts exposed through status. These are kept
+    /// small (5 rows) and use stable messages readable by the TUI alerts
+    /// pane.
+    pub alerts: Mutex<std::collections::VecDeque<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,9 +72,27 @@ impl Sched {
             shutdown: Arc::new(AtomicBool::new(false)),
             terminals: Mutex::new(HashMap::new()),
             idle: Mutex::new(HashMap::new()),
-            awaiting_ready: Mutex::new(HashMap::new()),
             running_since: Mutex::new(HashMap::new()),
+            hop_since: Mutex::new(HashMap::new()),
+            overlong_last: Mutex::new(HashMap::new()),
+            idle_pending_exit: Mutex::new(std::collections::HashSet::new()),
+            alerts: Mutex::new(std::collections::VecDeque::new()),
         })
+    }
+
+    pub fn note_alert(&self, text: String) {
+        let mut alerts = self.alerts.lock().unwrap();
+        alerts.retain(|line| line != &text);
+        if alerts.len() >= 5 {
+            alerts.pop_front();
+        }
+        alerts.push_back(text);
+    }
+
+    /// R4: lifecycle alerts (adopted / dropped-out / overlong) surfaced
+    /// through `status` so the TUI and巡检 read one source.
+    pub fn recent_alerts(&self) -> Vec<String> {
+        self.alerts.lock().unwrap().iter().cloned().collect()
     }
 
     pub fn emit(&self, typ: &str, data: serde_json::Value) {
@@ -83,6 +113,36 @@ impl Sched {
             .and_then(|r| r.get("max_attempts"))
             .and_then(|m| m.as_u64())
             .map(|m| m.min(u32::MAX as u64) as u32)
+    }
+
+    /// R4 timeouts from root `.onlyne/swarm.workspace.jsonc`:
+    /// `"timeouts": {"dispatched_secs": N, "busy_secs": {"<role>": N},
+    /// "idle_secs": N}`. Defaults: dispatched 120, busy unlimited per
+    /// role, idle 60. `ready` (delivery write) is a fixed 30s, not
+    /// configurable (a stuck FIFO write means the daemon is dead).
+    pub fn timeout_secs(&self, key: &str) -> u64 {
+        let raw = std::fs::read_to_string(crate::root::swarm_ws_config(&self.root))
+            .unwrap_or_default();
+        let v: serde_json::Value = crate::template::parse_lenient(&raw).unwrap_or_default();
+        v.get("timeouts")
+            .and_then(|t| t.get(key))
+            .and_then(|n| n.as_u64())
+            .unwrap_or(match key {
+                "dispatched_secs" => 120,
+                "idle_secs" => 60,
+                _ => 120,
+            })
+    }
+
+    /// R4 per-role busy (long-run) cap in seconds. None = unlimited.
+    pub fn busy_limit_secs(&self, role: &str) -> Option<u64> {
+        let raw = std::fs::read_to_string(crate::root::swarm_ws_config(&self.root))
+            .unwrap_or_default();
+        let v: serde_json::Value = crate::template::parse_lenient(&raw).unwrap_or_default();
+        v.get("timeouts")
+            .and_then(|t| t.get("busy_secs"))
+            .and_then(|b| b.get(role))
+            .and_then(|n| n.as_u64())
     }
 }
 
@@ -129,8 +189,40 @@ pub fn dispatch_public(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::R
     dispatch(sched, task_id, to)
 }
 
+/// R4 hop transition helper: persist hop_state + in-memory since + emit.
+/// `hop_since` tracks (state, entered_at) for TUI dwell display.
+fn set_hop(
+    sched: &Arc<Sched>,
+    task_id: &str,
+    from: &str,
+    to: &str,
+) -> anyhow::Result<()> {
+    sched.db.set_hop(task_id, to)?;
+    sched
+        .hop_since
+        .lock()
+        .unwrap()
+        .insert(task_id.into(), (to.into(), std::time::Instant::now()));
+    sched.emit(
+        "hop_state",
+        serde_json::json!({"task_id": task_id, "from_state": from, "to_state": to}),
+    );
+    Ok(())
+}
+
+fn current_hop(sched: &Arc<Sched>, task_id: &str) -> String {
+    sched
+        .db
+        .get(task_id)
+        .ok()
+        .flatten()
+        .map(|r| r.hop_state)
+        .unwrap_or_default()
+}
+
 fn dispatch(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::Result<()> {
-    // 1. Try idle pool (same workspace path affinity).
+    // 1. Try idle pool (same workspace path affinity). A reused pane is
+    // already ready with payload written inline: straight to busy (R4 §3).
     let idle_handle = sched
         .idle
         .lock()
@@ -153,14 +245,10 @@ fn dispatch(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::Result<()> {
         .lock()
         .unwrap()
         .insert(task_id.into(), term.handle.clone());
-    sched
-        .awaiting_ready
-        .lock()
-        .unwrap()
-        .insert(task_id.into(), std::time::Instant::now());
     sched.db.set_terminal(task_id, &term.handle)?;
     sched.db
         .set_state(task_id, crate::db::TaskState::Running)?;
+    let _ = set_hop(sched, task_id, "", "dispatched");
     sched.emit(
         "task_running",
         serde_json::json!({"task_id": task_id, "to": to, "terminal_handle": term.handle}),
@@ -183,10 +271,8 @@ pub fn on_ready(
     terminal_handle: &str,
 ) -> anyhow::Result<()> {
     let rows = sched.db.list(None, 200)?;
-    let awaiting = sched.awaiting_ready.lock().unwrap();
     let terminals = sched.terminals.lock().unwrap();
-    let candidate = match_candidate(&rows, &awaiting, &terminals, workspace, terminal_handle);
-    drop(awaiting);
+    let candidate = match_candidate(&rows, &terminals, workspace, terminal_handle);
     drop(terminals);
     match candidate {
         Some(task_id) => {
@@ -195,7 +281,11 @@ pub fn on_ready(
                 .lock()
                 .unwrap()
                 .insert(task_id.clone(), terminal_handle.into());
-            sched.awaiting_ready.lock().unwrap().remove(&task_id);
+            // R4: handshake matched => ready; deliver_to_terminal moves to
+            // busy on successful write. A failed write leaves ready so the
+            // 30s delivery guard (not the 120s handshake guard) owns it.
+            let from = current_hop(sched, &task_id);
+            let _ = set_hop(sched, &task_id, &from, "ready");
             deliver_to_terminal(sched, &task_id, workspace, terminal_handle)?;
             // Re-assert the swarm title: pi overwrites the create-time title
             // on boot, so without this the tab shows a generic pi title.
@@ -222,20 +312,80 @@ pub fn on_ready(
     }
 }
 
+/// R4: hop busy/idle reports from the session (pi-onlyne agent hooks).
+/// Body: `{workspace, terminal_handle, task_id[, pending_exit]}`.
+/// Match key is task_id (handles may change across adoption).
+pub fn on_hop_activity(
+    sched: &Arc<Sched>,
+    task_id: &str,
+    busy: bool,
+    pending_exit: bool,
+) -> anyhow::Result<()> {
+    let Some(task) = sched.db.get(task_id)? else {
+        return Ok(()); // Unknown task: race residue, silent drop.
+    };
+    match task.state {
+        crate::db::TaskState::Done
+        | crate::db::TaskState::Failed
+        | crate::db::TaskState::Cancelled
+        | crate::db::TaskState::Closed => {
+            sched.note_alert(format!(
+                "dropped-out: {} {}", &task_id[..8.min(task_id.len())], task.state.as_str()));
+            sched.emit(
+                "out_for_terminal_task_dropped",
+                serde_json::json!({"task_id": task_id, "state": task.state.as_str()}),
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+    let cur = task.hop_state.clone();
+    if busy {
+        // CR2: ''/dispatched/ready/idle -> busy are all normal (the plugin
+        // is faster than the scheduler on reuse + adoption paths). Only
+        // busy->busy is a no-op.
+        if cur == "busy" {
+            return Ok(());
+        }
+        set_hop(sched, task_id, &cur, "busy")?;
+        sched.idle_pending_exit.lock().unwrap().remove(task_id);
+        // A busy report proves liveness: refresh the delivery clock so the
+        // dead-terminal sweep cannot reap a working session.
+        sched.running_since.lock().unwrap().insert(task_id.into(), std::time::Instant::now());
+    } else {
+        if cur == "idle" {
+            return Ok(()); // duplicate idle: display heartbeat only, clock untouched
+        }
+        let _ = pending_exit; // reminder actor stays plugin-local (CR3); scheduler only records
+        if pending_exit {
+            sched.idle_pending_exit.lock().unwrap().insert(task_id.into());
+        } else {
+            sched.idle_pending_exit.lock().unwrap().remove(task_id);
+        }
+        set_hop(sched, task_id, &cur, "idle")?;
+    }
+    Ok(())
+}
+
 /// Pure matcher for on_ready: handle-first, path second. Kept free of IO
 /// so the race contract is unit-tested without a database.
 fn match_candidate(
     rows: &[crate::db::TaskRow],
-    awaiting: &HashMap<String, std::time::Instant>,
     terminals: &HashMap<String, String>,
     workspace: &str,
     terminal_handle: &str,
 ) -> Option<String> {
+    // R4: only handshake-waiting rows can accept `swarm_ready`. A live
+    // busy row retains its terminal handle for adoption, yet must never
+    // steal a later ready event for another task.
+    let waiting = |r: &crate::db::TaskRow| {
+        matches!(r.hop_state.as_str(), "" | "dispatched" | "ready")
+    };
     let eligible = |r: &crate::db::TaskRow| {
         (r.state == crate::db::TaskState::Pending
             || r.state == crate::db::TaskState::Running)
             && r.to_ws == workspace
-            && (awaiting.contains_key(&r.task_id) || terminals.contains_key(&r.task_id))
+            && waiting(r)
     };
     if !terminal_handle.is_empty() {
         if let Some(hit) = rows.iter().find(|r| {
@@ -287,6 +437,10 @@ fn deliver_to_terminal(
         .insert(task_id.into(), handle.into());
     sched.db
         .set_state(task_id, crate::db::TaskState::Running)?;
+    // R4: payload written => busy (covers fresh dispatch via on_ready and
+    // idle-pool reuse straight from dispatch).
+    let from = current_hop(sched, task_id);
+    let _ = set_hop(sched, task_id, &from, "busy");
     Ok(())
 }
 
@@ -327,6 +481,8 @@ pub fn on_out(
         | crate::db::TaskState::Failed
         | crate::db::TaskState::Cancelled
         | crate::db::TaskState::Closed => {
+            sched.note_alert(format!(
+                "dropped-out: {} {}", &task_id[..8.min(task_id.len())], task.state.as_str()));
             sched.emit(
                 "out_for_terminal_task_dropped",
                 serde_json::json!({"task_id": task_id, "from": from_ws, "state": task.state.as_str()}),
@@ -510,6 +666,8 @@ pub fn on_recycled(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::R
 /// recycle/quit, so this must not send another downlink control message.
 fn close_tab_only(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
     sched.running_since.lock().unwrap().remove(task_id);
+    sched.hop_since.lock().unwrap().remove(task_id);
+    let _ = sched.db.set_hop(task_id, "");
     let handle = sched.terminals.lock().unwrap().remove(task_id);
     if let Some(h) = handle {
         if !h.starts_with("stub-") {
@@ -591,6 +749,9 @@ fn force_kill(sched: &Arc<Sched>, task_id: &str) {
 
 fn close_terminal(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
     sched.running_since.lock().unwrap().remove(task_id);
+    sched.hop_since.lock().unwrap().remove(task_id);
+    // R4: terminal rows carry no hop substate.
+    let _ = sched.db.set_hop(task_id, "");
     let handle = sched.terminals.lock().unwrap().remove(task_id);
     if let Some(h) = handle {
         if h.starts_with("stub-") {
@@ -724,20 +885,19 @@ mod sched_tests {
         seed(&s, "other", "a", "", TaskState::Running);
         s.terminals.lock().unwrap().insert("own".into(), "term-OWN".into());
         s.terminals.lock().unwrap().insert("other".into(), "term-OTHER".into());
-        s.awaiting_ready.lock().unwrap().insert("own".into(), std::time::Instant::now());
-        s.awaiting_ready.lock().unwrap().insert("other".into(), std::time::Instant::now());
+        s.hop_since.lock().unwrap().insert("own".into(), ("dispatched".into(), std::time::Instant::now()));
+        s.hop_since.lock().unwrap().insert("other".into(), ("dispatched".into(), std::time::Instant::now()));
         // The rows list newest-first; path-only matching would pick "other".
         // Handle-first matching must pick the task whose terminal we created.
         let rows = s.db.list(None, 200).unwrap();
-        let awaiting = s.awaiting_ready.lock().unwrap();
         let terminals = s.terminals.lock().unwrap();
-        let hit = match_candidate(&rows, &awaiting, &terminals, "a", "term-OWN");
+        let hit = match_candidate(&rows, &terminals, "a", "term-OWN");
         assert_eq!(hit.as_deref(), Some("own"));
         // Unknown handle falls back to path matching without panic.
-        let hit = match_candidate(&rows, &awaiting, &terminals, "a", "term-STRANGER");
+        let hit = match_candidate(&rows, &terminals, "a", "term-STRANGER");
         assert!(hit == Some("own".into()) || hit == Some("other".into()));
         // Wrong workspace matches nothing.
-        assert_eq!(match_candidate(&rows, &awaiting, &terminals, "b", "term-OWN"), None);
+        assert_eq!(match_candidate(&rows, &terminals, "b", "term-OWN"), None);
     }
 
     #[test]
@@ -769,5 +929,65 @@ mod sched_tests {
         let (title, body) = crate::tui::detail_text(&detail);
         assert!(title.contains("abcdefgh"));
         assert!(body.contains("body"));
+    }
+
+    #[test]
+    fn hop_transitions_follow_allowed_edges() {
+        // R4 §6: dispatched→ready→busy→idle→busy→terminal; adoption lands busy.
+        let s = test_sched();
+        seed(&s, "h1", "a", "", TaskState::Running);
+        // '' -> dispatched (fresh dispatch path)
+        assert_eq!(current_hop(&s, "h1"), "");
+        set_hop(&s, "h1", "", "dispatched").unwrap();
+        assert_eq!(s.db.get("h1").unwrap().unwrap().hop_state, "dispatched");
+        // dispatched --busy--> busy (CR2: plugin faster than scheduler)
+        on_hop_activity(&s, "h1", true, false).unwrap();
+        assert_eq!(s.db.get("h1").unwrap().unwrap().hop_state, "busy");
+        // busy -> busy no-op
+        on_hop_activity(&s, "h1", true, false).unwrap();
+        assert_eq!(s.db.get("h1").unwrap().unwrap().hop_state, "busy");
+        // busy -> idle -> busy round trip
+        on_hop_activity(&s, "h1", false, true).unwrap();
+        assert_eq!(s.db.get("h1").unwrap().unwrap().hop_state, "idle");
+        on_hop_activity(&s, "h1", true, false).unwrap();
+        assert_eq!(s.db.get("h1").unwrap().unwrap().hop_state, "busy");
+        // idle --idle--> idle no-op (display heartbeat only)
+        on_hop_activity(&s, "h1", false, false).unwrap();
+        on_hop_activity(&s, "h1", false, false).unwrap();
+        assert_eq!(s.db.get("h1").unwrap().unwrap().hop_state, "idle");
+    }
+
+    #[test]
+    fn hop_activity_on_terminal_row_emits_drop() {
+        // R4 §6: busy/idle arriving at a terminal row reuses the drop event.
+        let s = test_sched();
+        seed(&s, "t1", "a", "", TaskState::Closed);
+        let mut rx = s.bus.sender().subscribe();
+        on_hop_activity(&s, "t1", true, false).unwrap();
+        let ev = rx.try_recv().expect("drop event emitted");
+        assert_eq!(ev.typ, "out_for_terminal_task_dropped");
+        // Unknown task: silent drop, no event.
+        let mut rx2 = s.bus.sender().subscribe();
+        on_hop_activity(&s, "ghost", true, false).unwrap();
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[test]
+    fn timeout_fail_closes_terminal() {
+        // CR1: timeout death and tab recycle are one transaction.
+        // on_early_exit ends in close_terminal; a stub handle exercises
+        // the bookkeeping without spawning orca.
+        let s = test_sched();
+        seed(&s, "c1", "a", "", TaskState::Running);
+        s.db.set_terminal("c1", "stub-x").unwrap();
+        s.terminals.lock().unwrap().insert("c1".into(), "stub-x".into());
+        s.hop_since.lock().unwrap()
+            .insert("c1".into(), ("dispatched".into(), std::time::Instant::now()));
+        on_early_exit(&s, "c1", "swarm_ready timeout").unwrap();
+        let t = s.db.get("c1").unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Failed);
+        assert!(!s.terminals.lock().unwrap().contains_key("c1"));
+        assert!(!s.hop_since.lock().unwrap().contains_key("c1"));
+        assert_eq!(t.hop_state, "");
     }
 }

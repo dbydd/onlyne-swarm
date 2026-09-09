@@ -132,6 +132,24 @@ fn route_event(
                 }
                 return;
             }
+            // R4: hop activity reports share the shape. `swarm_busy {…}` /
+            // `swarm_idle {…}` carry {workspace, terminal_handle, task_id,
+            // pending_exit?}; unknown prefixes stay ignored (version gate:
+            // plugins <0.9.0 never send these).
+            for (prefix, busy) in [("swarm_busy ", true), ("swarm_idle ", false)] {
+                if let Some(body) = msg_all.strip_prefix(prefix) {
+                    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+                    let task_id = parsed.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+                    let pending = parsed.get("pending_exit").and_then(|v| v.as_bool()).unwrap_or(false);
+                    consumed_ack(stream, v);
+                    if !task_id.is_empty() {
+                        if let Err(e) = sched::on_hop_activity(sched, task_id, busy, pending) {
+                            tracing::warn!(error = %e, "on_hop_activity failed");
+                        }
+                    }
+                    return;
+                }
+            }
             // pi-onlyne swarm-mode handshake arrives as a WorkspaceStateChanged
             // event whose message is `swarm_ready {workspace, terminal_handle}`.
             let msg = data

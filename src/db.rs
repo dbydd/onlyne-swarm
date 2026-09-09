@@ -63,6 +63,8 @@ pub struct TaskRow {
     pub out_head: String,
     pub reason: String,
     pub created_at: i64,
+    pub hop_state: String,
+    pub ledger_state: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -96,6 +98,8 @@ pub struct TaskDetailTask {
     pub out_head: String,
     pub reason: String,
     pub created_at: i64,
+    pub hop_state: String,
+    pub ledger_state: String,
 }
 
 impl From<TaskRow> for TaskDetailTask {
@@ -112,6 +116,8 @@ impl From<TaskRow> for TaskDetailTask {
             out_head: row.out_head,
             reason: row.reason,
             created_at: row.created_at,
+            hop_state: row.hop_state,
+            ledger_state: row.ledger_state,
         }
     }
 }
@@ -182,6 +188,18 @@ impl Db {
                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
              );",
         )?;
+        // R4: hop running-substate. Idempotent migration for pre-0.7.0
+        // databases: ADD COLUMN fails only if the column already exists.
+        let has_hop: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='hop_state'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if has_hop == 0 {
+            conn.execute_batch("ALTER TABLE tasks ADD COLUMN hop_state TEXT NOT NULL DEFAULT '';")?;
+        }
         Ok(Self {
             inner: Mutex::new(conn),
         })
@@ -220,6 +238,16 @@ impl Db {
         Ok(())
     }
 
+    /// R4 hop substate write. Empty string clears (terminal rows carry no
+    /// substate; queries treat '' as plain Running).
+    pub fn set_hop(&self, task_id: &str, hop: &str) -> anyhow::Result<()> {
+        self.inner.lock().unwrap().execute(
+            "UPDATE tasks SET hop_state=? WHERE task_id=?",
+            params![hop, task_id],
+        )?;
+        Ok(())
+    }
+
     /// Record a terminal ledger row: terminal state + out head + reason.
     pub fn set_ledger(
         &self,
@@ -246,7 +274,7 @@ impl Db {
         let mut st = c.prepare(
             "WITH RECURSIVE fam(id) AS (
                SELECT ? UNION SELECT task_id FROM tasks, fam WHERE transfer_send_to = fam.id
-             ) SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at
+             ) SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state
                FROM tasks WHERE task_id IN fam ORDER BY created_at ASC, rowid ASC",
         )?;
         let mapped = st.query_map(params![task_id], row)?;
@@ -265,7 +293,7 @@ impl Db {
         let limit = filter.limit.clamp(1, 500) as i64;
         let offset = filter.offset.min(i64::MAX as usize) as i64;
         let sql = format!(
-            "SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at \
+            "SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state \
              FROM tasks{where_sql} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?"
         );
         let mut row_args = args;
@@ -300,7 +328,7 @@ impl Db {
         let mut st = c.prepare(
             "WITH RECURSIVE fam(id) AS (
                SELECT ? UNION SELECT task_id FROM tasks, fam WHERE transfer_send_to = fam.id
-             ) SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at
+             ) SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state
                FROM tasks WHERE task_id IN fam ORDER BY created_at ASC, rowid ASC",
         )?;
         let children = collect_rows(st.query_map(params![task_id], row)?)?
@@ -387,7 +415,7 @@ impl Db {
 
 fn get_with_conn(c: &Connection, task_id: &str) -> anyhow::Result<Option<TaskRow>> {
     let mut st = c.prepare(
-        "SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at \
+        "SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state \
          FROM tasks WHERE task_id=?",
     )?;
     let mut rows = st.query(params![task_id])?;
@@ -458,6 +486,8 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         out_head: r.get(8).unwrap_or_default(),
         reason: r.get(9).unwrap_or_default(),
         created_at: r.get(10).unwrap_or_default(),
+        hop_state: r.get(11).unwrap_or_default(),
+        ledger_state: r.get(12).unwrap_or_default(),
     })
 }
 
@@ -490,6 +520,33 @@ pub fn append_ledger_line(root: &Path, ev: &LedgerEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hop_state_migrates_idempotent_on_old_db() {
+        // R4 §6 migration edge: a pre-0.7.0 tasks table without hop_state
+        // gains the column on open; reopening is a no-op; old rows read ''.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("swarm.db");
+        std::fs::create_dir_all(dir.path().join(".onlyne")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE tasks(task_id TEXT PRIMARY KEY, from_ws TEXT NOT NULL, to_ws TEXT NOT NULL, transfer_send_to TEXT NOT NULL DEFAULT '', attempt INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'pending', terminal TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL DEFAULT '', out_head TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', ledger_state TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0);",
+            ).unwrap();
+            conn.execute("INSERT INTO tasks(task_id, from_ws, to_ws) VALUES('old1', '.', 'a')", []).unwrap();
+        }
+        // Open through a root pointing at this dir: Db::open must add the
+        // column without touching existing rows.
+        let root = dir.path();
+        // Db::open resolves <root>/.onlyne/swarm.db; relocate the file.
+        std::fs::create_dir_all(root.join(".onlyne")).unwrap();
+        std::fs::rename(&db_path, root.join(".onlyne/swarm.db")).unwrap();
+        let db = Db::open(root).unwrap();
+        let db2 = Db::open(root).unwrap(); // idempotent reopen
+        let _ = db2;
+        db.insert_task("new1", ".", "a", "", 1, "p").unwrap();
+        db.set_hop("new1", "busy").unwrap();
+        assert_eq!(db.get("new1").unwrap().unwrap().hop_state, "busy");
+    }
     fn insert_id(
         db: &Db,
         id: &str,
