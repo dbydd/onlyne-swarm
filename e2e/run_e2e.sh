@@ -43,9 +43,24 @@ wait_state() { # wait_state <id8> <want> <timeout_secs>
   return 1
 }
 
+# Kill only schedulers rooted in this test tree. A blanket
+# `pkill -f "onlyne-swarm run"` kills every ring on the machine — including
+# unrelated production schedulers (observed: a live ARIS ring). Resolve each
+# candidate's cwd and match it against $E2E_ROOT; if the cwd is unreadable,
+# skip rather than risk a wrong kill.
+kill_tree_schedulers() {
+  local pid cwd
+  for pid in $(pgrep -f "onlyne-swarm run" 2>/dev/null || true); do
+    cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    case "$cwd" in
+      "$E2E_ROOT" | "$E2E_ROOT"/*) kill "$pid" 2>/dev/null || true ;;
+    esac
+  done
+}
+
 cleanup() {
   log "tearing down scheduler + daemons + stubs"
-  pkill -f "onlyne-swarm run" 2>/dev/null || true
+  kill_tree_schedulers
   # shellcheck disable=SC2046
   kill $(ps aux | grep "[o]nlyne --workspace $E2E_ROOT" | awk '{print $2}') 2>/dev/null || true
   pkill -f "stub_e2e1.py $E2E_ROOT" 2>/dev/null || true

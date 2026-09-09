@@ -113,8 +113,10 @@ reconcile tests — use a scratch root or `SWARM_STUB_AGENT=1`.
 and logs to `.onlyne/logs/scheduler.log`; the launching shell returns
 immediately and Ctrl-C there is harmless. `stop` sends SIGTERM, waits up to
 5s for the scheduler's own shutdown (socket + pid unlinked), then SIGKILLs.
-`status` with no live pid reports `no scheduler running` and clears a stale
-socket. Adoption is unchanged: restart re-adopts live sessions either way.
+`status` with no live pid reports `no scheduler running` and exits non-zero,
+so scripts can use it as an up-probe. It never deletes the socket: a stale
+socket is taken over by the next `run`. Adoption is unchanged: restart
+re-adopts live sessions either way.
 
 swarm-ready gates apply equally to root and every instance:
 `.onlyne/config.toml` has `[swarm] enabled = true`, `.pi/onlyne.json` has

@@ -194,16 +194,19 @@ async fn main() -> anyhow::Result<()> {
                     Ok(())
                 }
                 Err(e) => {
-                    // R4: no socket AND no live pid means nothing to attach
-                    // to. Report the real reason instead of a raw
-                    // ECONNREFUSED, so a leftover socket from a killed
-                    // scheduler is distinguishable from a clean stop.
-                    if !proc_alive(&root_p) {
-                        let _ = std::fs::remove_file(root::swarm_sock(&root_p));
-                        println!("no scheduler running (stale socket cleaned)");
-                        Ok(())
-                    } else {
+                    // R4: `status` doubles as the up-probe in scripts (e2e),
+                    // so "nothing to attach to" must exit non-zero. A
+                    // friendly line with exit 0 would read as "scheduler is
+                    // up" and race a real start. The socket is never removed
+                    // here: serve() takes over stale sockets, and a
+                    // foreground scheduler has no pid file to prove it is
+                    // alive.
+                    if proc_alive(&root_p) {
+                        // Pid says alive but the socket is dead: a real fault.
                         Err(e)
+                    } else {
+                        eprintln!("no scheduler running at {}", root_p.display());
+                        std::process::exit(1);
                     }
                 }
             }
