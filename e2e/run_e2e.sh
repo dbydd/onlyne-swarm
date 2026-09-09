@@ -15,6 +15,11 @@
 set -euo pipefail
 
 E2E_ROOT="${E2E_ROOT:-$PWD/.e2e-tree}"
+# Physical path for process-cwd matching: on macOS /tmp is a symlink to
+# /private/tmp, so a literal compare against $E2E_ROOT never matches lsof
+# output and cleanup silently skips every leaked scheduler. Resolve the
+# parent (E2E_ROOT may not exist yet) and rejoin the basename.
+E2E_ROOT_PHYS="$(cd "$(dirname -- "$E2E_ROOT")" 2>/dev/null && pwd -P)/$(basename -- "$E2E_ROOT")"
 REPO="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ONLYNE_BIN="${ONLYNE_BIN:-$(cd "$REPO/../../.." && pwd)/target/debug/onlyne}"
 SWARM_BIN="${SWARM_BIN:-$(cd "$REPO/.." && pwd)/target/debug/onlyne-swarm}"
@@ -53,7 +58,7 @@ kill_tree_schedulers() {
   for pid in $(pgrep -f "onlyne-swarm run" 2>/dev/null || true); do
     cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
     case "$cwd" in
-      "$E2E_ROOT" | "$E2E_ROOT"/*) kill "$pid" 2>/dev/null || true ;;
+      "$E2E_ROOT_PHYS" | "$E2E_ROOT_PHYS"/*) kill "$pid" 2>/dev/null || true ;;
     esac
   done
 }
