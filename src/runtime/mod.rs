@@ -152,10 +152,9 @@ pub(crate) fn unsupported(backend: &str, operation: &str, detail: &str) -> anyho
     anyhow::anyhow!("runtime backend {backend} does not support {operation}: {detail}")
 }
 
-/// Auto-probe: pick the first backend that reports available + can spawn +
-/// probe. Reserved for callers that explicitly want capability discovery
-/// (e.g. a future `swarm doctor`). It is NOT the scheduler default: see
-/// `default_backend`.
+/// Auto-probe: pick the first backend that reports available and can spawn +
+/// probe. Reached through `SWARM_RUNTIME=auto`, or directly by callers such as
+/// `swarm doctor` that want capability discovery.
 pub fn select_backend(runner: Arc<dyn Runner>) -> Result<Box<dyn SessionBackend>> {
     let backends: [Box<dyn SessionBackend>; 3] = [
         Box::new(herdr::HerdrBackend::new(runner.clone())),
@@ -183,14 +182,15 @@ pub fn backend_by_name(name: &str, runner: Arc<dyn Runner>) -> Result<Box<dyn Se
     }
 }
 
-/// Resolve a backend name to a concrete backend. Empty or unknown names
-/// fall back to `"orca"` (the historical default) with the reason logged.
+/// Resolve a backend name to a concrete backend. `auto` probes capability.
+/// Empty or unknown names fall back to `"orca"` (the historical default) with
+/// the reason logged.
 pub fn backend_for(requested: &str, runner: Arc<dyn Runner>) -> Result<Box<dyn SessionBackend>> {
-    let name = if requested.trim().is_empty() {
-        "orca"
-    } else {
-        requested
-    };
+    let name = requested.trim();
+    if name.eq_ignore_ascii_case("auto") {
+        return select_backend(runner);
+    }
+    let name = if name.is_empty() { "orca" } else { name };
     match backend_by_name(name, runner.clone()) {
         Ok(b) => Ok(b),
         Err(e) => {
@@ -201,12 +201,13 @@ pub fn backend_for(requested: &str, runner: Arc<dyn Runner>) -> Result<Box<dyn S
 }
 
 /// Scheduler default backend: deterministic, driven by `SWARM_RUNTIME`
-/// (orca|zellij|herdr|fake), defaulting to `orca`. Orca is the historical
-/// single backend and its liveness contract treats a failed probe as
-/// unknown-alive; an env-var default keeps `ORCA_CLI_COMMAND` test
-/// fixtures and operator setups reproducible on machines where zellij or
-/// herdr happen to also be installed. This never auto-probes capability, so
-/// an installed-but-unwanted zellij/herdr cannot hijack the scheduler.
+/// (`auto` | `orca` | `zellij` | `herdr` | `fake`), defaulting to `orca`.
+/// Orca is the historical single backend and its liveness contract treats a
+/// failed probe as unknown-alive; an env-var default keeps `ORCA_CLI_COMMAND`
+/// test fixtures and operator setups reproducible on machines where zellij or
+/// herdr happen to also be installed. Capability discovery is available through
+/// the explicit `auto` value, so an installed backend only joins selection when
+/// the operator asks for it.
 pub fn default_backend() -> Result<Box<dyn SessionBackend>> {
     backend_for(
         &std::env::var("SWARM_RUNTIME").unwrap_or_default(),
@@ -266,16 +267,49 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_default_is_deterministic_not_capability_probed() {
-        // Resolution must be name-driven, never capability-probed: on a
-        // machine with zellij/herdr installed a probe would silently drive
-        // real sessions. Empty -> orca; known names honored; unknown -> orca.
+    fn auto_selection_uses_the_documented_priority() {
+        #[derive(Default)]
+        struct AutoRunner {
+            calls: Mutex<Vec<String>>,
+        }
+        impl Runner for AutoRunner {
+            fn run(
+                &self,
+                program: &str,
+                _: &[String],
+                _: Option<&Path>,
+                _: &BTreeMap<String, String>,
+            ) -> Result<CommandOutput> {
+                self.calls.lock().unwrap().push(program.to_owned());
+                let zellij = program == "zellij";
+                Ok(CommandOutput {
+                    status: if zellij { 0 } else { 1 },
+                    stdout: if zellij {
+                        b"session\n".to_vec()
+                    } else {
+                        vec![]
+                    },
+                    stderr: b"missing".to_vec(),
+                })
+            }
+        }
+        let runner = Arc::new(AutoRunner::default());
+        let backend = backend_for("AUTO", runner.clone()).unwrap();
+        assert_eq!(backend.name(), "zellij");
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            &["herdr".to_string(), "zellij".to_string()]
+        );
+    }
+
+    #[test]
+    fn scheduler_default_uses_orca_unless_auto_is_requested() {
         let runner = Arc::new(ProbeRunner::default());
         assert_eq!(backend_for("", runner.clone()).unwrap().name(), "orca");
         assert_eq!(backend_for("orca", runner.clone()).unwrap().name(), "orca");
         assert_eq!(backend_for("fake", runner.clone()).unwrap().name(), "fake");
         assert_eq!(backend_for("nope", runner.clone()).unwrap().name(), "orca");
-        // Name resolution performs no availability probe.
+        // Empty and named modes resolve deterministically without probing.
         assert!(runner.0.lock().unwrap().is_empty());
     }
 }

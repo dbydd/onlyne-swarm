@@ -3342,4 +3342,286 @@ mod tests {
             "the new generation owes no handoff yet"
         );
     }
+
+    /// The #18 acceptance walk: one FakeBackend scheduler exercises the public
+    /// dispatch/report/daemon path, crash adoption, the mismatch ladder, intent
+    /// exhaustion, recovery lineage, and report watermark idempotence in one
+    /// durable ledger.
+    #[test]
+    fn fake_backend_reconcile_end_to_end_walks_the_supervision_matrix() {
+        let (sched, probe) = live_sched();
+        let daemon = fake_daemon(&sched, "worker");
+        let mut rx = sched.bus.sender().subscribe();
+        sched
+            .db
+            .insert_task("e2e-worker", ".", "worker", "", 1, "finish e2e")
+            .unwrap();
+        sched
+            .db
+            .insert_task("e2e-sibling", ".", "worker", "", 1, "keep running")
+            .unwrap();
+        sched::dispatch_public(&sched, "e2e-worker", "worker").expect("dispatch worker");
+        sched::dispatch_public(&sched, "e2e-sibling", "worker").expect("dispatch sibling");
+        let worker_handle = sched
+            .terminals
+            .lock()
+            .unwrap()
+            .get("e2e-worker")
+            .cloned()
+            .expect("worker handle");
+
+        // Startup sees the two backend-live sessions and adopts them instead of
+        // calling their pre-ready transition residue failed.
+        let startup = startup_reconcile(&sched);
+        assert_eq!(startup.scanned, 2, "{startup:?}");
+        assert_eq!(startup.open, 2, "{startup:?}");
+        assert_eq!(startup.faults, 0, "{startup:?}");
+        assert_eq!(sched.db.counts().unwrap()["running"], 2);
+
+        // Ready -> turn started -> out -> recycle ack follows public events.
+        sched::on_ready(&sched, "worker", &worker_handle).expect("worker ready");
+        let ready = row(&sched, "e2e-worker");
+        assert_eq!(ready.public_lifecycle, "idle", "{ready:?}");
+        assert_eq!(ready.resource_state, "attached");
+        assert_eq!(ready.agent_state, "ready");
+        let turn_version = next_version(&sched, "e2e-worker").unwrap();
+        let turn = feed_turn_started(&sched, "e2e-worker").expect("worker turn started");
+        assert!(matches!(turn, Verdict::Applied(_)), "{turn:?}");
+        let working = row(&sched, "e2e-worker");
+        assert_eq!(working.public_lifecycle, "working", "{working:?}");
+        assert_eq!(working.agent_state, "running");
+        assert_eq!(working.seq, turn_version.seq as i64);
+
+        // A replay and a stale generation cost no watermark slot and no write.
+        let working_before_replay = working.observed_json.clone();
+        let replay = feed_turn_started(&sched, "e2e-worker").expect("duplicate turn");
+        assert!(matches!(replay, Verdict::Ignored(_)), "{replay:?}");
+        assert_eq!(
+            row(&sched, "e2e-worker").observed_json,
+            working_before_replay,
+            "a duplicate report is idempotent"
+        );
+        let stale = apply_report(
+            &sched,
+            &report(LifecycleKind::TurnStarted, "e2e-worker", 0, 99),
+        )
+        .expect("stale generation report");
+        assert!(matches!(stale, Verdict::Ignored(_)), "{stale:?}");
+        assert_eq!(
+            row(&sched, "e2e-worker").observed_json,
+            working_before_replay,
+            "a stale generation is idempotent"
+        );
+
+        // The handoff is consumed by the task ledger and settled by reconcile.
+        let out = crate::proto::SwarmMessage {
+            header: crate::proto::SwarmHeader {
+                task_id: "e2e-worker".into(),
+                from: "worker".into(),
+                transfer_send_to: String::new(),
+                attempt: 1,
+            },
+            payload: "e2e result".into(),
+        };
+        sched::on_out(&sched, "worker", &out).expect("worker out");
+        assert_eq!(
+            sched.db.get("e2e-worker").unwrap().unwrap().state,
+            TaskState::Closed
+        );
+        let mirror_version = next_version(&sched, "e2e-worker").unwrap();
+        let mirror = apply_report(
+            &sched,
+            &report(
+                LifecycleKind::Heartbeat,
+                "e2e-worker",
+                mirror_version.generation,
+                mirror_version.seq,
+            ),
+        )
+        .expect("heartbeat frame");
+        assert!(
+            matches!(mirror, Verdict::Ignored(_)),
+            "the closed tuple rejects later evidence: {mirror:?}"
+        );
+        assert_eq!(outcome_of(&sched, "e2e-worker"), "done");
+
+        sched::on_recycled(&sched, "e2e-worker", "e2e done").expect("worker recycle ack");
+        let closed = row(&sched, "e2e-worker");
+        assert_eq!(closed.public_lifecycle, "exited", "{closed:?}");
+        assert_eq!(closed.agent_state, "gone");
+        assert_eq!(closed.resource_state, "closed");
+        assert!(sched.terminals.lock().unwrap().get("e2e-worker").is_none());
+        assert!(sched.db.list_faults(Some("e2e-worker")).unwrap().is_empty());
+
+        // A live sibling remains independent while the next generation enters
+        // the mismatch ladder. The switch is backend-wide, so first settle the
+        // sibling; its result becomes history and cannot be counted twice.
+        let sibling_handle = sched
+            .terminals
+            .lock()
+            .unwrap()
+            .get("e2e-sibling")
+            .cloned()
+            .expect("sibling handle");
+        sched::on_ready(&sched, "worker", &sibling_handle).expect("sibling ready");
+        let sibling_out = crate::proto::SwarmMessage {
+            header: crate::proto::SwarmHeader {
+                task_id: "e2e-sibling".into(),
+                from: "worker".into(),
+                transfer_send_to: String::new(),
+                attempt: 1,
+            },
+            payload: "sibling result".into(),
+        };
+        sched::on_out(&sched, "worker", &sibling_out).expect("sibling out");
+        sched::on_recycled(&sched, "e2e-sibling", "sibling done").expect("sibling recycle");
+        assert_eq!(outcome_of(&sched, "e2e-sibling"), "done");
+
+        sched
+            .db
+            .insert_task("e2e-retry", ".", "worker", "", 1, "retry e2e")
+            .unwrap();
+        sched::dispatch_public(&sched, "e2e-retry", "worker").expect("dispatch retry");
+        probe.detach_panes();
+        for round in 1..DEFAULT_TERMINATE_AFTER {
+            let summary = periodic_reconcile(&sched);
+            assert_eq!(summary.mismatch, 1, "round {round}: {summary:?}");
+            assert_eq!(row(&sched, "e2e-retry").mismatch_count, round as i64);
+        }
+        let ceiling = periodic_reconcile(&sched);
+        assert_eq!(ceiling.faults, 1, "{ceiling:?}");
+        assert_eq!(ceiling.recoveries, 1, "{ceiling:?}");
+        let retry = row(&sched, "e2e-retry");
+        assert_eq!(retry.public_lifecycle, "exited", "{retry:?}");
+        assert_eq!(outcome_of(&sched, "e2e-retry"), "failed");
+        let faults = sched.db.list_faults(Some("e2e-retry")).unwrap();
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert_eq!(faults[0].kind, "mismatch_terminate");
+        assert_eq!(faults[0].state, "recovery_created");
+        let recovery_id = faults[0]
+            .recovery_task_id
+            .clone()
+            .expect("terminate creates recovery");
+        let recovery = sched.db.get(&recovery_id).unwrap().expect("recovery task");
+        assert_eq!(recovery.kind, "recovery");
+        assert_eq!(
+            recovery.failure_of.as_deref(),
+            Some(faults[0].id.to_string().as_str())
+        );
+
+        // The recovery task's daemon is gone, so its recycle intent burns the
+        // full transport budget and the single-layer guard leaves its own fault
+        // for the root supervisor.
+        probe.bring_up(&recovery_id);
+        sched.sessions.lock().unwrap().insert(
+            recovery_id.clone(),
+            SessionRef {
+                task_id: recovery_id.clone(),
+                backend: "fake".into(),
+                backend_ref: serde_json::json!({"handle": format!("term-{recovery_id}")}),
+                generation: 1,
+            },
+        );
+        let recovery_op = request_recycle(&sched, &recovery_id, "close").expect("recovery intent");
+        let first_attempt = intent(&sched, &recovery_op);
+        assert_eq!(first_attempt.attempt, 1);
+        let second = pump_intents(&sched, first_attempt.next_attempt_at);
+        assert_eq!(second.retried, 1, "{second:?}");
+        let spent = pump_intents(&sched, intent(&sched, &recovery_op).next_attempt_at);
+        assert_eq!(spent.exhausted, 1, "{spent:?}");
+        let exhausted = intent(&sched, &recovery_op);
+        assert_eq!(exhausted.state, "exhausted", "{exhausted:?}");
+        assert_eq!(exhausted.attempt, 3);
+        assert_eq!(row(&sched, &recovery_id).delivery_state, "exhausted");
+        assert_eq!(
+            daemon
+                .lock()
+                .unwrap()
+                .requests
+                .iter()
+                .filter(|request| {
+                    request["op"] == "loopback"
+                        && request["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("op: recycle"))
+                })
+                .count(),
+            2,
+            "three successful deliveries and three exhausted budget attempts reach the daemon"
+        );
+        let recovery_faults = sched.db.list_faults(Some(&recovery_id)).unwrap();
+        assert_eq!(recovery_faults.len(), 1, "{recovery_faults:?}");
+        assert_eq!(recovery_faults[0].kind, "intent_exhausted");
+        assert_eq!(recovery_faults[0].state, "open");
+        assert!(recovery_faults[0].recovery_task_id.is_none());
+        assert_eq!(sched.db.list_faults(None).unwrap().len(), 2);
+
+        // A second Pi generation stays parked until reconcile proves the old
+        // resource gone, adoption resets its watermark, and repair stamps the
+        // operator action.
+        let later = apply_report(&sched, &report(LifecycleKind::Ready, "e2e-retry", 2, 1))
+            .expect("generation report");
+        assert!(
+            matches!(
+                later,
+                Verdict::Rejected(crate::lifecycle::RejectReason::UnadoptedGeneration)
+            ),
+            "{later:?}"
+        );
+        assert_eq!(row(&sched, "e2e-retry").generation, 1);
+        let summary = periodic_reconcile(&sched);
+        assert_eq!(summary.dead, 0, "previous detach already counted this row");
+        probe.kill("e2e-retry");
+        let seen = crate::repair::inspect(&sched, "e2e-retry").expect("inspect generation");
+        assert_eq!(seen["probe"]["state"], "gone", "{seen}");
+        let adopted = crate::repair::adopt(&sched, "e2e-retry").expect("adopt generation");
+        assert_eq!(adopted["generation"], 2, "{adopted}");
+        let accepted = apply_report(&sched, &report(LifecycleKind::Ready, "e2e-retry", 2, 1))
+            .expect("post-adopt generation report");
+        assert!(matches!(accepted, Verdict::Applied(_)), "{accepted:?}");
+        let adopted_row = row(&sched, "e2e-retry");
+        assert_eq!((adopted_row.generation, adopted_row.seq), (2, 1));
+        assert_eq!(adopted_row.agent_state, "ready");
+        assert!(
+            sched
+                .db
+                .operator_revision("e2e-retry")
+                .unwrap()
+                .is_some_and(|stamp| stamp.contains("adopt")),
+            "adoption must leave an operator revision"
+        );
+
+        let mut lifecycle = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if event.typ == "lifecycle" {
+                lifecycle.push((
+                    event.data["task_id"].as_str().unwrap_or("?").to_string(),
+                    event.data["from"].as_str().unwrap_or("?").to_string(),
+                    event.data["to"].as_str().unwrap_or("?").to_string(),
+                ));
+            }
+        }
+        assert!(
+            lifecycle.contains(&("e2e-worker".into(), "working".into(), "exited".into())),
+            "{lifecycle:?}"
+        );
+        assert!(
+            lifecycle
+                .iter()
+                .any(|(task, from, to)| task == "e2e-retry" && from == "created" && to == "exited"),
+            "{lifecycle:?}"
+        );
+        assert!(
+            lifecycle.contains(&("e2e-retry".into(), "exited".into(), "created".into())),
+            "{lifecycle:?}"
+        );
+        assert_eq!(
+            sched.db.get("e2e-worker").unwrap().unwrap().state,
+            TaskState::Closed
+        );
+        assert_eq!(
+            sched.db.get("e2e-sibling").unwrap().unwrap().state,
+            TaskState::Closed
+        );
+    }
 }

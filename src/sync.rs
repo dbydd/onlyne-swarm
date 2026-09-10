@@ -63,192 +63,6 @@ pub struct SyncReport {
     pub gaps: Vec<String>,
 }
 
-/// Files/dirs under an instance `.pi/` that are install artifacts or
-/// caches: never inherited from root, pi installs them on first boot.
-const PI_SKIP_ENTRIES: &[&str] = &["npm", "node_modules", "cache", "sessions", "themes"];
-
-/// Ensure `.ws/<role>/.pi/onlyne.json` carries `watch.autoStart = true`.
-/// pi-onlyne reads `watch.autoStart` (default false) from `<cwd>/.pi/onlyne.json`;
-/// without it the watcher never starts and `swarm_ready` is never emitted,
-/// so every task to that workspace hangs until the ready-timeout.
-/// Merges with existing keys: only the `watch.autoStart` leaf is forced.
-fn ensure_onlyne_autostart(pi_dir: &Path) -> anyhow::Result<bool> {
-    let path = pi_dir.join("onlyne.json");
-    let mut v: serde_json::Value = if path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&path)?).unwrap_or(serde_json::Value::Null)
-    } else {
-        serde_json::Value::Null
-    };
-    if !v.is_object() {
-        v = serde_json::json!({});
-    }
-    let changed = v
-        .get("watch")
-        .and_then(|w| w.get("autoStart"))
-        .and_then(|a| a.as_bool())
-        != Some(true);
-    if changed {
-        if v.get("watch").map(|w| w.is_object()).unwrap_or(false) {
-            v["watch"]["autoStart"] = serde_json::json!(true);
-        } else {
-            v["watch"] = serde_json::json!({"autoStart": true});
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, serde_json::to_string_pretty(&v)? + "\n")?;
-    }
-    Ok(changed)
-}
-
-/// Materialize an instance `.pi/` dir from root `.pi/` with per-role override.
-///
-/// Source priority: `.agents/.schedule/<role>/.pi/**` > `<root>/.pi/**`.
-/// Copy-if-absent per file (same rule as instance config): existing values
-/// are never touched; `--force` (future flag) may overwrite. Skips install
-/// artifacts and caches (npm/, node_modules/, cache/, sessions/, themes/).
-/// `settings.json` IS inherited; `hindsight.json` is per-role and NOT
-/// inherited by default. Returns true when anything was written.
-#[allow(dead_code)]
-fn materialize_pi(root: &Path, role_path: &str, ws: &Path) -> anyhow::Result<bool> {
-    // Skip the root pseudo-workspace: it IS the source.
-    if role_path.is_empty() {
-        return Ok(false);
-    }
-    let mut changed = false;
-    let dst = ws.join(".pi");
-    let role_src = crate::root::schedule_dir(root).join(role_path).join(".pi");
-    let root_src = root.join(".pi");
-    // Union of filenames from both layers.
-    let mut names: std::collections::BTreeSet<String> = Default::default();
-    for layer in [&role_src, &root_src] {
-        if let Ok(rd) = std::fs::read_dir(layer) {
-            for e in rd.flatten() {
-                if let Some(n) = e.file_name().to_str() {
-                    if !n.starts_with('.') {
-                        names.insert(n.to_string());
-                    }
-                }
-            }
-        }
-    }
-    // hindsight.json is per-role state: never inherit from root.
-    names.remove("hindsight.json");
-    for name in &names {
-        if PI_SKIP_ENTRIES.contains(&name.as_str()) {
-            continue;
-        }
-        let src = if role_src.join(name).exists() {
-            role_src.join(name)
-        } else {
-            root_src.join(name)
-        };
-        let target = dst.join(name);
-        if target.exists() {
-            continue;
-        }
-        if src.is_dir() {
-            copy_dir_recursive(&src, &target)?;
-            changed = true;
-        } else if src.is_file() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(&src, &target)?;
-            changed = true;
-        }
-    }
-    if ensure_onlyne_autostart(&dst)? {
-        changed = true;
-    }
-    Ok(changed)
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for e in std::fs::read_dir(src)? {
-        let e = e?;
-        let name = e.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with('.') || PI_SKIP_ENTRIES.contains(&name_str.as_ref()) {
-            continue;
-        }
-        let (s, d) = (e.path(), dst.join(&name));
-        if e.file_type()?.is_dir() {
-            copy_dir_recursive(&s, &d)?;
-        } else {
-            std::fs::copy(&s, &d)?;
-        }
-    }
-    Ok(())
-}
-
-/// Append `[swarm] enabled = true` to an existing instance config that
-/// predates the template (R2 drift guard). Idempotent: configs already
-/// carrying the section are untouched. Ported from init's ensure_swarm_enabled
-/// so `workspace create` and `run` share one rule.
-#[allow(dead_code)]
-fn ensure_swarm_enabled(cfg_path: &Path) -> anyhow::Result<bool> {
-    use std::fmt::Write as _;
-    if !cfg_path.exists() {
-        return Ok(false);
-    }
-    let text = std::fs::read_to_string(cfg_path)?;
-    // Scan section-aware: only an `enabled` line inside `[swarm]` counts.
-    let mut in_swarm = false;
-    let mut has_enabled_true = false;
-    let mut has_swarm_section = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_swarm = t == "[swarm]";
-            has_swarm_section |= in_swarm;
-            continue;
-        }
-        if in_swarm && t.starts_with("enabled") {
-            if t.split_once('=')
-                .map(|(_, v)| v.trim() == "true")
-                .unwrap_or(false)
-            {
-                has_enabled_true = true;
-            }
-        }
-    }
-    if has_enabled_true {
-        return Ok(false);
-    }
-    let mut out = text;
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    if has_swarm_section {
-        // Section exists but enabled!=true: flip the line in place.
-        let mut fixed = String::new();
-        let mut in_sw = false;
-        for line in out.lines() {
-            let t = line.trim();
-            if t.starts_with('[') {
-                in_sw = t == "[swarm]";
-                fixed.push_str(line);
-                fixed.push('\n');
-                continue;
-            }
-            if in_sw && t.starts_with("enabled") {
-                let _ = writeln!(fixed, "enabled = true");
-                in_sw = false; // only first occurrence
-                continue;
-            }
-            fixed.push_str(line);
-            fixed.push('\n');
-        }
-        std::fs::write(cfg_path, fixed)?;
-    } else {
-        out.push_str("\n[swarm]\nenabled = true\n");
-        std::fs::write(cfg_path, out)?;
-    }
-    Ok(true)
-}
-
 /// Swarm-ready three gates for one workspace (R3). Returns the list of
 /// missing gates; empty means ready. Pure over the filesystem so the
 /// contract is unit-tested without a scheduler:
@@ -404,11 +218,12 @@ fn bootstrap_child(root: &Path, ws: &Path, e: &Effective) -> anyhow::Result<()> 
 
 ///
 /// - Missing instance dirs are created with loopback-only config + effective snapshot.
-/// - Existing instances: config, `.pi/`, and `swarm.workspace.jsonc` are never
-///   overwritten. Pre-existing `onlyne_in/` views are diagnosed and preserved.
-/// - Every instance `.pi/` is materialized additive (copy-if-absent) from
-///   root `.pi/` with per-role `.schedule/<role>/.pi/` override; `onlyne.json`
-///   always ends with `watch.autoStart = true`.
+/// - Existing instances are supervisor-owned. Sync reports readiness gaps and
+///   preserves generated files, including every file under `.pi/`.
+/// - New instances are created once by `bootstrap_child` from root
+///   `.pi/settings.json`, then owned by the instance runtime.
+/// - Template layers define role, model, and back-edge declarations.
+///   `.schedule/<role>/.pi/**` remains inert workspace metadata.
 /// - New workspaces use the workspace daemon's loopback RPC. Existing
 ///   `onlyne_in/` views are compatibility state and receive no new links.
 /// - Instances with no description are kept and reported as orphans (never deleted).
@@ -640,17 +455,14 @@ mod tests {
     }
 
     #[test]
-    fn pi_materializes_copy_if_absent_with_role_override() {
+    fn instance_pi_files_are_preserved_and_template_pi_stays_inert() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        // Root .pi has settings + onlyne.json (autoStart off) + skipped npm/.
+        // Root .pi has settings + onlyne.json. Bootstrap limits instance Pi
+        // files to the declared gate files.
         std::fs::create_dir_all(root.join(".pi/npm")).unwrap();
         std::fs::write(root.join(".pi/npm/pkg"), "x").unwrap();
-        std::fs::write(
-            root.join(".pi/settings.json"),
-            r#"{"packages":["npm:pi-onlyne@^0.8.1"]}"#,
-        )
-        .unwrap();
+        std::fs::write(root.join(".pi/root-only.json"), r#"{"local":true}"#).unwrap();
         std::fs::write(
             root.join(".pi/onlyne.json"),
             r#"{"watch":{"autoStart":false},"keep":"mine"}"#,
@@ -668,7 +480,13 @@ mod tests {
             r#"{"role":"override"}"#,
         )
         .unwrap();
-        run_sync(root).unwrap();
+        std::fs::write(
+            root.join(".agents/.schedule/a/.pi/theme.json"),
+            r#"{"theme":"unused"}"#,
+        )
+        .unwrap();
+        let rep = run_sync(root).unwrap();
+        assert!(rep.created.iter().any(|c| c == "a"));
         let pi = root.join(".ws/a/.pi");
         let settings: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(pi.join("settings.json")).unwrap())
@@ -690,11 +508,15 @@ mod tests {
             v.pointer("/watch/autoStart"),
             Some(&serde_json::json!(true))
         );
+        assert!(settings.get("role").is_none());
         assert!(!pi.join("npm").exists());
-        // Later sync preserves hand-edited supervisor files.
+        assert!(!pi.join("root-only.json").exists());
+        assert!(!pi.join("theme.json").exists());
+        // Later sync preserves hand-edited supervisor files and reports drift.
         std::fs::write(pi.join("settings.json"), r#"{"hand":true}"#).unwrap();
         std::fs::write(pi.join("onlyne.json"), r#"{"watch":{"autoStart":false}}"#).unwrap();
-        run_sync(root).unwrap();
+        std::fs::write(pi.join("hindsight.json"), r#"{"local":true}"#).unwrap();
+        let rep = run_sync(root).unwrap();
         assert_eq!(
             std::fs::read_to_string(pi.join("settings.json")).unwrap(),
             r#"{"hand":true}"#
@@ -703,6 +525,21 @@ mod tests {
             std::fs::read_to_string(pi.join("onlyne.json")).unwrap(),
             r#"{"watch":{"autoStart":false}}"#
         );
+        assert_eq!(
+            std::fs::read_to_string(pi.join("hindsight.json")).unwrap(),
+            r#"{"local":true}"#
+        );
+        assert!(rep
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("a: missing watch.autoStart")));
+        assert!(rep
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("a: missing pi-onlyne")));
+        assert!(!pi.join("npm").exists());
+        assert!(!pi.join("root-only.json").exists());
+        assert!(!pi.join("theme.json").exists());
     }
 
     #[test]
