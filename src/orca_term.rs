@@ -128,14 +128,33 @@ pub fn focus(handle: &str) -> anyhow::Result<()> {
 /// Interpret an Orca `terminal show --json` response. This pure function
 /// keeps the dead-session contract testable without global env mutation.
 /// Probe failures/stale handles are *unknown*, treated alive: only an explicit
-/// `status=exited|closed|dead` lets the reaper fail/retry a task.
+/// `status=exited|closed|dead` or a stale/exited exit cause lets the reaper
+/// fail/retry a task. An operator close by the human is also terminal: without
+/// this, a task whose pane the operator recycled would sit `busy` forever.
 pub fn terminal_is_alive_response(v: Option<&Value>) -> bool {
     let Some(v) = v else { return true };
     if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
         return true;
     }
-    let status = v.pointer("/result/terminal/status").and_then(|s| s.as_str());
-    !matches!(status, Some("exited") | Some("closed") | Some("dead"))
+    let status = v
+        .pointer("/result/terminal/status")
+        .and_then(|s| s.as_str());
+    let closed_status = matches!(status, Some("exited") | Some("closed") | Some("dead"));
+    let exit_kind = v
+        .pointer("/result/terminal/exitCause/kind")
+        .and_then(|k| k.as_str());
+    let connected = v
+        .pointer("/result/terminal/connected")
+        .and_then(|c| c.as_bool());
+    let writable = v
+        .pointer("/result/terminal/writable")
+        .and_then(|w| w.as_bool());
+    let exited_cause = matches!(
+        exit_kind,
+        Some("stale") | Some("exited") | Some("closed") | Some("operator_close")
+    ) && matches!(connected, Some(false))
+        && matches!(writable, Some(false));
+    !(closed_status || exited_cause)
 }
 
 /// Liveness probe: only explicit exited status means dead; RPC failures stay
@@ -163,7 +182,11 @@ pub fn close(handle: &str) -> anyhow::Result<()> {
 #[allow(dead_code)]
 pub fn kill_pi_for_task(handle: &str, task_id: &str) -> anyhow::Result<()> {
     let task_id = shell_escape(task_id);
-    send(handle, &format!("pkill -TERM -P $$ -f ONLYNE_SWARM_TASK={task_id} 2>/dev/null; exit"), true)
+    send(
+        handle,
+        &format!("pkill -TERM -P $$ -f ONLYNE_SWARM_TASK={task_id} 2>/dev/null; exit"),
+        true,
+    )
 }
 
 /// Legacy entry: task id unknown (kept for API compat; no live callers).
@@ -267,10 +290,7 @@ mod tests {
 
     #[test]
     fn session_command_quotes_paths_and_task() {
-        let cmd = session_command(
-            std::path::Path::new("/tmp/a b/c"),
-            "task-1",
-        );
+        let cmd = session_command(std::path::Path::new("/tmp/a b/c"), "task-1");
         assert!(cmd.starts_with("cd '/tmp/a b/c'"), "{cmd}");
         assert!(cmd.contains("ONLYNE_SWARM_TASK='task-1'"), "{cmd}");
         assert!(cmd.ends_with(" pi"), "{cmd}");
@@ -288,10 +308,18 @@ mod tests {
         // operator can see them (folder-kind nodes are not listable).
         assert_eq!(
             create_argv("swarm:a:12345678", false),
-            vec!["terminal", "create", "--title", "swarm:a:12345678", "--command"]
+            vec![
+                "terminal",
+                "create",
+                "--title",
+                "swarm:a:12345678",
+                "--command"
+            ]
         );
         assert_eq!(
-            create_argv("swarm:a:12345678", true).last().map(String::as_str),
+            create_argv("swarm:a:12345678", true)
+                .last()
+                .map(String::as_str),
             Some("--command")
         );
         assert!(create_argv("t", true).contains(&"--focus".to_string()));
@@ -302,8 +330,21 @@ mod tests {
     fn terminal_liveness_requires_explicit_exited_status() {
         assert!(terminal_is_alive_response(None));
         assert!(terminal_is_alive_response(Some(&json!({"ok": false}))));
-        assert!(terminal_is_alive_response(Some(&json!({"ok": true, "result": {"terminal": {"status": "running"}}}))));
-        assert!(!terminal_is_alive_response(Some(&json!({"ok": true, "result": {"terminal": {"status": "exited"}}}))));
+        assert!(terminal_is_alive_response(Some(
+            &json!({"ok": true, "result": {"terminal": {"status": "running"}}})
+        )));
+        assert!(!terminal_is_alive_response(Some(
+            &json!({"ok": true, "result": {"terminal": {"status": "exited"}}})
+        )));
+        // Seen live on 0.7.0: operator-recycled panes have no status string,
+        // only a disconnected, unwritable tab with an exit cause.
+        assert!(!terminal_is_alive_response(Some(
+            &json!({"ok": true, "result": {"terminal": {"connected": false, "writable": false, "exitCause": {"kind": "operator_close"}}}})
+        )));
+        // A merely idle-but-attached tab is still alive.
+        assert!(terminal_is_alive_response(Some(
+            &json!({"ok": true, "result": {"terminal": {"connected": true, "writable": true, "exitCause": {"kind": "operator_close"}}}})
+        )));
     }
 
     #[test]
@@ -319,8 +360,10 @@ mod tests {
         // Regression: the old `pgrep pi | head -1` fallback could SIGTERM
         // the supervisor or a sibling hop during a marquee cancel.
         // kill strings must scope to the terminal shell AND the task id.
-        let cmd = format!("pkill -TERM -P $$ -f ONLYNE_SWARM_TASK={} 2>/dev/null; exit",
-            shell_escape("task-abc-123"));
+        let cmd = format!(
+            "pkill -TERM -P $$ -f ONLYNE_SWARM_TASK={} 2>/dev/null; exit",
+            shell_escape("task-abc-123")
+        );
         assert!(cmd.contains("-P $$"));
         assert!(cmd.contains("ONLYNE_SWARM_TASK='task-abc-123'"));
         assert!(!cmd.contains("head -1"));

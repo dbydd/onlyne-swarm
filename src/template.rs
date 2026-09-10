@@ -212,13 +212,10 @@ pub fn load_tree(root: &Path) -> anyhow::Result<Vec<Effective>> {
 
 fn root_back_edges(root: &Path) -> anyhow::Result<Vec<String>> {
     let t = load_opt(&crate::root::swarm_ws_config(root))?;
-    Ok(t.map(|t| {
-        t.back_edges
-            .iter()
-            .map(|e| normalize_edge("", e))
-            .collect()
-    })
-    .unwrap_or_default())
+    Ok(
+        t.map(|t| t.back_edges.iter().map(|e| normalize_edge("", e)).collect())
+            .unwrap_or_default(),
+    )
 }
 
 fn collect_dirs(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
@@ -228,8 +225,8 @@ fn collect_dirs(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
             // Dot-dirs (`.pi/`, `.git/`, `.DS_Store/` etc.) are tooling
             // metadata, never workspace layers. Without this a per-role
             // `.pi/settings.json` materializes a phantom `<role>/.pi`
-            // instance and `refresh_links` dies on EEXIST(17) against the
-            // `onlyne_in/<role>` symlink file (observed 2026-09-08).
+            // instance that legacy `onlyne_in` diagnostics could misread
+            // against the `onlyne_in/<role>` symlink file (observed 2026-09-08).
             if e.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
@@ -335,10 +332,22 @@ mod tests {
     fn dot_dirs_are_not_workspace_layers() {
         // regression (2026-09-08): a per-role `.pi/settings.json` made
         // collect_dirs treat `.pi` as a `<role>/.pi` workspace; run_sync
-        // then materialized phantom instances and refresh_links died on
-        // EEXIST(17) against the `onlyne_in/<role>` symlink file.
+        // then materialized phantom instances and legacy `onlyne_in`
+        // diagnostics could misread the `onlyne_in/<role>` symlink file.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        std::fs::create_dir_all(root.join(".pi")).unwrap();
+        std::fs::write(
+            root.join(".pi/settings.json"),
+            r#"{"packages":["./harness/pi-onlyne"]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("harness/pi-onlyne")).unwrap();
+        std::fs::write(
+            root.join("harness/pi-onlyne/package.json"),
+            r#"{"name":"pi-onlyne"}"#,
+        )
+        .unwrap();
         std::fs::create_dir_all(root.join(".agents/.schedule/a/.pi")).unwrap();
         std::fs::write(
             root.join(".agents/.schedule/a/template.workspace.jsonc"),
@@ -347,7 +356,11 @@ mod tests {
         .unwrap();
         std::fs::write(root.join(".agents/.schedule/a/.pi/settings.json"), "{}").unwrap();
         let tree = load_tree(root).unwrap();
-        assert!(tree.iter().all(|e| e.path != "a/.pi"), "got {:?}", tree.iter().map(|e| &e.path).collect::<Vec<_>>());
+        assert!(
+            tree.iter().all(|e| e.path != "a/.pi"),
+            "got {:?}",
+            tree.iter().map(|e| &e.path).collect::<Vec<_>>()
+        );
         let rep = crate::sync::run_sync(root).unwrap();
         assert!(!rep.created.iter().any(|c| c == "a/.pi"));
         assert!(!root.join(".ws/a/.pi/.onlyne").exists());

@@ -20,10 +20,7 @@ fn ping(sock: &Path) -> bool {
         return false;
     };
     let mut s = s;
-    if s
-        .write_all(b"{\"id\":\"ping\",\"op\":\"ping\"}\n")
-        .is_err()
-    {
+    if s.write_all(b"{\"id\":\"ping\",\"op\":\"ping\"}\n").is_err() {
         return false;
     }
     s.set_read_timeout(Some(Duration::from_millis(150))).ok();

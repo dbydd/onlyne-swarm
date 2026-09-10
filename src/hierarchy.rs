@@ -70,7 +70,11 @@ pub enum HierarchyOutcome {
 
 /// Remove the folder-kind node for one workspace dir if present.
 /// Best effort; never fails sync.
-pub fn ensure_child(_project: Option<&str>, dir: &std::path::Path, _display_name: &str) -> HierarchyOutcome {
+pub fn ensure_child(
+    _project: Option<&str>,
+    dir: &std::path::Path,
+    _display_name: &str,
+) -> HierarchyOutcome {
     if !reachable() {
         return HierarchyOutcome::Skipped;
     }

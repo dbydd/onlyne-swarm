@@ -49,6 +49,11 @@ fn watch_once(sched: &Arc<Sched>, ws_path: &str, sock: &std::path::Path) -> anyh
     stream.write_all(
         b"{\"id\":\"swarm\",\"op\":\"subscribe_events\",\"priority\":4294967295,\"consume_timeout_ms\":400}\n",
     )?;
+    // The subscription can start after a daemon already emitted swarm_ready.
+    // Replay only ready messages whose exact handle is currently tracked by
+    // this scheduler. This closes the reconnect/startup loss window without
+    // allowing an old workspace-local ready to claim a different task.
+    replay_ready_history(sched, ws_path, sock, None);
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     loop {
@@ -68,12 +73,94 @@ fn watch_once(sched: &Arc<Sched>, ws_path: &str, sock: &std::path::Path) -> anyh
     }
 }
 
-fn route_event(
+/// Replay ready messages published before this event subscription attached.
+/// An optional handle filters to one newly created terminal; this exact binding
+/// closes the daemon-restart window without replaying an older workspace task.
+pub(crate) fn replay_ready_history(
     sched: &Arc<Sched>,
     ws_path: &str,
-    v: &serde_json::Value,
-    stream: &mut UnixStream,
+    sock: &std::path::Path,
+    only_handle: Option<&str>,
 ) {
+    let Ok(stream) = UnixStream::connect(sock) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut reader = BufReader::new(stream);
+    let mut offset = 0u32;
+    let mut items = Vec::new();
+    loop {
+        let request = serde_json::json!({
+            "id": format!("swarm-ready-replay-{offset}"),
+            "op": "fetch_channel_history",
+            "channel_id": "loopback",
+            "limit": 100,
+            "offset": offset,
+        });
+        if writeln!(reader.get_mut(), "{request}").is_err() {
+            return;
+        }
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            return;
+        };
+        let Some(page) = value.pointer("/data") else {
+            return;
+        };
+        if let Some(page_items) = page.get("messages").and_then(|v| v.as_array()) {
+            items.extend(page_items.iter().cloned());
+            let has_more = page
+                .get("has_more")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !has_more {
+                break;
+            }
+            offset = offset.saturating_add(page_items.len() as u32);
+            if page_items.is_empty() {
+                break;
+            }
+        } else if let Some(page_items) = page.as_array() {
+            items.extend(page_items.iter().cloned());
+            break;
+        } else {
+            return;
+        }
+    }
+    let tracked: std::collections::HashSet<String> =
+        sched.terminals.lock().unwrap().values().cloned().collect();
+    for item in items {
+        if item.get("direction").and_then(|v| v.as_str()) == Some("outbound") {
+            continue;
+        }
+        let Some(text) = item.get("text").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(body) = text.strip_prefix("swarm_ready ") else {
+            continue;
+        };
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) else {
+            continue;
+        };
+        let Some(handle) = parsed.get("terminal_handle").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !tracked.contains(handle) || only_handle.is_some_and(|expected| expected != handle) {
+            continue;
+        }
+        let workspace = parsed
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .and_then(|absolute| tree_path_for(sched, absolute))
+            .unwrap_or_else(|| ws_path.to_string());
+        let _ = sched::on_ready(sched, &workspace, handle);
+    }
+}
+
+fn route_event(sched: &Arc<Sched>, ws_path: &str, v: &serde_json::Value, stream: &mut UnixStream) {
     if v.get("event").and_then(|e| e.as_bool()) != Some(true) {
         return;
     }
@@ -85,10 +172,13 @@ fn route_event(
     let data = if inner.is_object() { inner } else { data };
     match typ {
         "inbound_message" => {
-            let text = data
-                .get("text")
-                .and_then(|t| t.as_str())
-                .unwrap_or("");
+            let text = data.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            // A `---swarm-report` frame is lifecycle evidence for the reducer,
+            // not a task delivery: consume it and stop before the task paths.
+            if crate::reconcile::try_report(sched, ws_path, text) {
+                consumed_ack(stream, v);
+                return;
+            }
             if let Some(msg) = crate::proto::parse(text) {
                 // Swarm task inbound: schedule a session for it. Do NOT
                 // consume: the pi-onlyne session sits at tier 1 and needs
@@ -98,10 +188,11 @@ fn route_event(
             }
         }
         "outbound_message" => {
-            let text = data
-                .get("text")
-                .and_then(|t| t.as_str())
-                .unwrap_or("");
+            let text = data.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            if crate::reconcile::try_report(sched, ws_path, text) {
+                consumed_ack(stream, v);
+                return;
+            }
             if let Some(msg) = crate::proto::parse(text) {
                 consumed_ack(stream, v);
                 if let Err(e) = sched::on_out(sched, ws_path, &msg) {
@@ -115,14 +206,14 @@ fn route_event(
             // close_terminal may already have observed the same ack by polling
             // history; on_recycled is idempotent so a late event only closes
             // the tab handle if it somehow remains.
-            let msg_all = data
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
+            let msg_all = data.get("message").and_then(|m| m.as_str()).unwrap_or("");
             if let Some(body) = msg_all.strip_prefix("swarm_recycled ") {
                 let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
                 let task_id = parsed.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                let reason = parsed.get("reason").and_then(|v| v.as_str()).unwrap_or("recycled");
+                let reason = parsed
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("recycled");
                 tracing::info!(workspace = %ws_path, task = %task_id, reason = %reason, "swarm_recycled ack observed");
                 consumed_ack(stream, v);
                 if !task_id.is_empty() {
@@ -140,7 +231,10 @@ fn route_event(
                 if let Some(body) = msg_all.strip_prefix(prefix) {
                     let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
                     let task_id = parsed.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-                    let pending = parsed.get("pending_exit").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let pending = parsed
+                        .get("pending_exit")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     consumed_ack(stream, v);
                     if !task_id.is_empty() {
                         if let Err(e) = sched::on_hop_activity(sched, task_id, busy, pending) {
@@ -152,10 +246,7 @@ fn route_event(
             }
             // pi-onlyne swarm-mode handshake arrives as a WorkspaceStateChanged
             // event whose message is `swarm_ready {workspace, terminal_handle}`.
-            let msg = data
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("");
+            let msg = data.get("message").and_then(|m| m.as_str()).unwrap_or("");
             let body = msg.strip_prefix("swarm_ready ").unwrap_or("");
             if body.is_empty() {
                 return;
@@ -259,14 +350,8 @@ mod tests {
         assert_eq!(tree_path_for_root("/r", "/r"), Some(".".into()));
         assert_eq!(tree_path_for_root("/r", "/r/"), Some(".".into()));
         // Nested instances.
-        assert_eq!(
-            tree_path_for_root("/r", "/r/.ws/a"),
-            Some("a".into())
-        );
-        assert_eq!(
-            tree_path_for_root("/r", "/r/.ws/a/b/"),
-            Some("a/b".into())
-        );
+        assert_eq!(tree_path_for_root("/r", "/r/.ws/a"), Some("a".into()));
+        assert_eq!(tree_path_for_root("/r", "/r/.ws/a/b/"), Some("a/b".into()));
         // Tree-relative input passes through (tests, supervisor submits).
         assert_eq!(tree_path_for_root("/r", "a"), Some("a".into()));
         // Outside the tree: no mapping.

@@ -1,9 +1,28 @@
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use std::path::{Path, PathBuf};
 
-/// The swarm root is the scheduler's startup cwd. No upward search.
+/// The scheduler's startup cwd is the swarm root. No upward search.
 pub fn cwd_root(cwd: &Path) -> PathBuf {
     cwd.to_path_buf()
+}
+
+/// Resolve the swarm root for client commands launched from a generated
+/// workspace. The scheduler remains single-instance at the root socket;
+/// nested `.ws/<role>` directories only borrow that control plane.
+pub fn client_root(cwd: &Path) -> PathBuf {
+    let mut cur = cwd.to_path_buf();
+    loop {
+        if cur.join(".onlyne/run/swarm.sock").exists()
+            || cur.join(".onlyne/swarm.db").exists()
+            || (cur.join(".ws").is_dir() && cur.join(".agents/.schedule").is_dir())
+        {
+            return cur;
+        }
+        match cur.parent() {
+            Some(parent) if parent != cur => cur = parent.to_path_buf(),
+            _ => return cwd.to_path_buf(),
+        }
+    }
 }
 
 /// Refuse to start a scheduler in a nested directory: any ancestor containing
@@ -70,8 +89,7 @@ pub fn resolve_instance(root: &Path, target: &str) -> PathBuf {
 }
 
 pub fn loopback_in(ws_root: &Path) -> PathBuf {
-    ws_root
-        .join(".onlyne/channels/loopback/in")
+    ws_root.join(".onlyne/channels/loopback/in")
 }
 
 pub fn onlyne_sock(ws_root: &Path) -> PathBuf {
@@ -92,6 +110,22 @@ mod tests {
     }
 
     #[test]
+    fn nested_client_commands_resolve_root_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let worker = root.join(".ws/bench");
+        std::fs::create_dir_all(worker.join(".onlyne/run")).unwrap();
+        std::fs::create_dir_all(root.join(".onlyne/run")).unwrap();
+        std::fs::create_dir_all(root.join(".agents/.schedule")).unwrap();
+        std::fs::write(root.join(".onlyne/run/swarm.sock"), "").unwrap();
+        assert_eq!(client_root(&worker), root);
+        assert_eq!(client_root(&root), root);
+        let unrelated = dir.path().join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        assert_eq!(client_root(&unrelated), unrelated);
+    }
+
+    #[test]
     fn nested_start_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
@@ -102,5 +136,4 @@ mod tests {
         assert!(err.to_string().contains("nested swarm start refused"));
         assert!(ensure_root(&child, true).is_ok());
     }
-
 }

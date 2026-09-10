@@ -136,6 +136,11 @@ onlyne-swarm list
 onlyne-swarm list --state running
 ```
 
+Client commands (`status`, `list`, `submit`, `cancel`, `tui`) also resolve the
+nearest swarm root socket when run from `.ws/<role>`; the scheduler remains a
+single root-owned process. `run` remains a root command and keeps its nested
+start guard.
+
 `run` syncs once, starts missing daemons, subscribes to priority event
 streams, and serves `.onlyne/run/swarm.sock`. Each dispatch opens one Orca
 terminal with `pi` (env `ONLYNE_SWARM_TASK` carries the assigned task id).

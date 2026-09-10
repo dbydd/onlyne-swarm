@@ -435,7 +435,10 @@ fn pull(sock: &Path, filter: &HistoryFilter, page_size: usize) -> Snapshot {
     // R4: merge the live hop clock into each active row so the graph colors
     // an overlong busy hop red (design §4) without threading a side map
     // through every layout helper.
-    let hops = status.get("hops").cloned().unwrap_or(serde_json::Value::Null);
+    let hops = status
+        .get("hops")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let active_tasks: Vec<serde_json::Value> = active_tasks
         .into_iter()
         .map(|mut task| {
@@ -535,8 +538,8 @@ fn sync_selection_and_detail(
     ) {
         Ok(value) => {
             if let Some(data) = value.get("data") {
-            state.detail = Some(data.clone());
-        }
+                state.detail = Some(data.clone());
+            }
         }
         Err(error) => state.message = format!("detail failed: {error}"),
     }
@@ -932,7 +935,15 @@ fn render_keys(frame: &mut ratatui::Frame, area: Rect, state: &UiState) {
         .and_then(|hop| {
             let state = hop.get("state")?.as_str()?;
             let secs = hop.get("secs")?.as_u64()?;
-            let mark = if hop.get("adopted").and_then(|v| v.as_bool()).unwrap_or(false) { "*" } else { "" };
+            let mark = if hop
+                .get("adopted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                "*"
+            } else {
+                ""
+            };
             Some(format!("   hop {state} {}{mark}", format_secs(secs)))
         })
         .unwrap_or_default();
@@ -996,12 +1007,7 @@ pub(crate) fn build_graph_layout(
     let busy_pairs = active_tasks
         .iter()
         .filter(|task| task_string(task, "hop_state") == "busy")
-        .map(|task| {
-            (
-                task_string(task, "from_ws"),
-                task_string(task, "to_ws"),
-            )
-        })
+        .map(|task| (task_string(task, "from_ws"), task_string(task, "to_ws")))
         .collect::<BTreeSet<_>>();
     let mut row_y = 0usize;
 
@@ -1387,7 +1393,11 @@ fn graph_task_text(task: &serde_json::Value, selected: bool) -> String {
         _ if state == "running" => "■",
         _ => "·",
     };
-    let label = if hop.is_empty() { state.as_str() } else { hop.as_str() };
+    let label = if hop.is_empty() {
+        state.as_str()
+    } else {
+        hop.as_str()
+    };
     let handle = task_string(task, "terminal");
     let live = if !handle.is_empty() && !handle.starts_with("stub-") {
         " ◉"
@@ -1465,6 +1475,15 @@ fn alerts(snapshot: &Snapshot) -> Vec<AlertLine> {
             "dangling-link: {}",
             dangling.as_str().unwrap_or("?")
         ));
+    }
+    for legacy in snapshot
+        .status
+        .get("legacy_views")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+    {
+        alerts.push(format!("legacy-view: {}", legacy.as_str().unwrap_or("?")));
     }
     for recent in snapshot
         .status
@@ -1547,7 +1566,10 @@ pub(crate) fn detail_text(detail: &serde_json::Value) -> (String, String) {
         Some(hop) if hop.is_object() => {
             let state = hop.get("state").and_then(|v| v.as_str()).unwrap_or("?");
             let secs = hop.get("secs").and_then(|v| v.as_u64()).unwrap_or(0);
-            let adopted = hop.get("adopted").and_then(|v| v.as_bool()).unwrap_or(false);
+            let adopted = hop
+                .get("adopted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let mark = if adopted { " (adopted)" } else { "" };
             format!("hop {state} for {}{mark}", format_secs(secs))
         }
@@ -1762,7 +1784,10 @@ mod tests {
         assert!(graph_task_text(&disp, false).contains('…'));
         // overlong red: a hop object with overlong=true renders Failed.
         let overlong = serde_json::json!({"task_id":"oooooooo-1","state":"running","hop_state":"busy","from_ws":".","to_ws":"a","hop":{"state":"busy","secs":9999,"overlong":true}});
-        let workspaces = vec![role(".", "root", "ready", &[]), role("a", "worker", "ready", &[])];
+        let workspaces = vec![
+            role(".", "root", "ready", &[]),
+            role("a", "worker", "ready", &[]),
+        ];
         let layout = build_graph_layout(
             &workspaces,
             &[overlong],

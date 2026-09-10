@@ -1,8 +1,11 @@
-use anyhow::Context;
-use rusqlite::{Connection, params, params_from_iter, types::Value as SqlValue};
-use serde::Serialize;
+use anyhow::{anyhow, Context};
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
+
+const SCHEMA_VERSION: i64 = 2;
+const PROTOCOL_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LedgerEvent {
@@ -65,6 +68,13 @@ pub struct TaskRow {
     pub created_at: i64,
     pub hop_state: String,
     pub ledger_state: String,
+    /// `'normal'` for scheduled work, `'recovery'` for a task that exists
+    /// because a fault needs an owner. `link_fault_recovery` owns the write, so
+    /// every recovery row traces back to exactly one fault row.
+    pub kind: String,
+    /// Fault id this task recovers, `Some` only when `kind == "recovery"`. The
+    /// single-layer recovery gate reads this column.
+    pub failure_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,6 +110,8 @@ pub struct TaskDetailTask {
     pub created_at: i64,
     pub hop_state: String,
     pub ledger_state: String,
+    pub kind: String,
+    pub failure_of: Option<String>,
 }
 
 impl From<TaskRow> for TaskDetailTask {
@@ -118,6 +130,8 @@ impl From<TaskRow> for TaskDetailTask {
             created_at: row.created_at,
             hop_state: row.hop_state,
             ledger_state: row.ledger_state,
+            kind: row.kind,
+            failure_of: row.failure_of,
         }
     }
 }
@@ -149,6 +163,78 @@ pub struct GraphData {
     pub edges: Vec<GraphEdge>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub task_id: String,
+    pub agent_state: String,
+    pub delivery_state: String,
+    pub resource_state: String,
+    pub public_lifecycle: String,
+    pub recovery_substate: String,
+    pub desired_json: String,
+    pub observed_json: String,
+    pub generation: i64,
+    pub seq: i64,
+    pub backend_ref: String,
+    pub mismatch_count: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IntentRecord {
+    pub op_id: String,
+    pub task_id: String,
+    pub kind: String,
+    pub payload_json: String,
+    pub attempt: i64,
+    pub next_attempt_at: i64,
+    pub state: String,
+    pub receipt_json: String,
+    pub last_error: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FaultRecord {
+    pub id: i64,
+    pub task_id: String,
+    pub session_id: String,
+    pub generation: i64,
+    pub seq: i64,
+    pub desired_json: String,
+    pub observed_json: String,
+    pub intent: String,
+    pub attempt: i64,
+    pub backend_ref: String,
+    pub kind: String,
+    pub reason: String,
+    pub state: String,
+    pub recovery_task_id: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VersionedSession {
+    pub agent_state: String,
+    pub delivery_state: String,
+    pub resource_state: String,
+    pub public_lifecycle: String,
+    pub recovery_substate: String,
+    pub desired_json: String,
+    pub observed_json: String,
+    pub generation: i64,
+    pub seq: i64,
+    pub backend_ref: String,
+    pub mismatch_count: i64,
+    pub updated_at: i64,
+}
+
+/// Serialize a payload for its JSON text column.
+fn json_text<T: Serialize + ?Sized>(value: &T) -> anyhow::Result<String> {
+    Ok(serde_json::to_string(value)?)
+}
+
 pub struct Db {
     inner: Mutex<Connection>,
 }
@@ -160,8 +246,6 @@ impl Db {
             std::fs::create_dir_all(p)?;
         }
         let conn = Connection::open(&path).with_context(|| format!("open {}", path.display()))?;
-        // Amendment-1 schema: no pending_replies, no dead_letter table.
-        // Old databases carry the old layout; they are dropped, not migrated.
         let old_layout: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='pending_replies'",
@@ -170,39 +254,326 @@ impl Db {
             )
             .unwrap_or(0);
         if old_layout > 0 {
-            conn.execute_batch("DROP TABLE IF EXISTS tasks;")?;
+            return Err(anyhow!("unsupported legacy tasks schema: pending_replies"));
         }
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS tasks(
-               task_id TEXT PRIMARY KEY,
-               from_ws TEXT NOT NULL,
-               to_ws TEXT NOT NULL,
-               transfer_send_to TEXT NOT NULL DEFAULT '',
-               attempt INTEGER NOT NULL DEFAULT 1,
-               state TEXT NOT NULL DEFAULT 'pending',
-               terminal TEXT NOT NULL DEFAULT '',
-               payload TEXT NOT NULL DEFAULT '',
-               out_head TEXT NOT NULL DEFAULT '',
-               reason TEXT NOT NULL DEFAULT '',
-               ledger_state TEXT NOT NULL DEFAULT '',
-               created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_marker(
+               name TEXT PRIMARY KEY, version INTEGER NOT NULL, protocol_version INTEGER NOT NULL
              );",
         )?;
-        // R4: hop running-substate. Idempotent migration for pre-0.7.0
-        // databases: ADD COLUMN fails only if the column already exists.
-        let has_hop: i64 = conn
+        let marker: Option<(i64, i64)> = tx
             .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='hop_state'",
+                "SELECT version, protocol_version FROM schema_marker WHERE name='swarm'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((version, protocol)) = marker {
+            if version != SCHEMA_VERSION || protocol != PROTOCOL_VERSION {
+                return Err(anyhow!(
+                    "unsupported swarm schema version {version}, protocol {protocol}"
+                ));
+            }
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tasks(
+               task_id TEXT PRIMARY KEY, from_ws TEXT NOT NULL, to_ws TEXT NOT NULL,
+               transfer_send_to TEXT NOT NULL DEFAULT '', attempt INTEGER NOT NULL DEFAULT 1,
+               state TEXT NOT NULL DEFAULT 'pending', terminal TEXT NOT NULL DEFAULT '',
+               payload TEXT NOT NULL DEFAULT '', out_head TEXT NOT NULL DEFAULT '',
+               reason TEXT NOT NULL DEFAULT '', ledger_state TEXT NOT NULL DEFAULT '',
+               created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+               hop_state TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'normal',
+               failure_of TEXT, protocol_version INTEGER NOT NULL DEFAULT 2,
+               operator_revision TEXT NOT NULL DEFAULT ''
+             );
+             CREATE TABLE IF NOT EXISTS sessions(
+               task_id TEXT PRIMARY KEY, agent_state TEXT NOT NULL, delivery_state TEXT NOT NULL,
+               resource_state TEXT NOT NULL, public_lifecycle TEXT NOT NULL, recovery_substate TEXT NOT NULL,
+               desired_json TEXT NOT NULL, observed_json TEXT NOT NULL, generation INTEGER NOT NULL,
+               seq INTEGER NOT NULL, backend_ref TEXT NOT NULL, mismatch_count INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS intents(
+               op_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, kind TEXT NOT NULL,
+               payload_json TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
+               next_attempt_at INTEGER NOT NULL, state TEXT NOT NULL, receipt_json TEXT NOT NULL,
+               last_error TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS faults(
+               id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, session_id TEXT NOT NULL,
+               generation INTEGER NOT NULL, seq INTEGER NOT NULL, desired_json TEXT NOT NULL,
+               observed_json TEXT NOT NULL, intent TEXT NOT NULL, attempt INTEGER NOT NULL,
+               backend_ref TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT NOT NULL, state TEXT NOT NULL,
+               recovery_task_id TEXT, created_at INTEGER NOT NULL
+             );",
+        )?;
+        for (name, sql) in [
+            (
+                "hop_state",
+                "ALTER TABLE tasks ADD COLUMN hop_state TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "kind",
+                "ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'normal'",
+            ),
+            ("failure_of", "ALTER TABLE tasks ADD COLUMN failure_of TEXT"),
+            (
+                "protocol_version",
+                "ALTER TABLE tasks ADD COLUMN protocol_version INTEGER NOT NULL DEFAULT 2",
+            ),
+            (
+                "operator_revision",
+                "ALTER TABLE tasks ADD COLUMN operator_revision TEXT NOT NULL DEFAULT ''",
+            ),
+        ] {
+            let exists: i64 = tx.query_row(
+                &format!("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name='{name}'"),
                 [],
                 |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if has_hop == 0 {
-            conn.execute_batch("ALTER TABLE tasks ADD COLUMN hop_state TEXT NOT NULL DEFAULT '';")?;
+            )?;
+            if exists == 0 {
+                tx.execute_batch(sql)?;
+            }
         }
+        tx.execute(
+            "INSERT OR REPLACE INTO schema_marker(name, version, protocol_version) VALUES('swarm', ?, ?)",
+            params![SCHEMA_VERSION, PROTOCOL_VERSION],
+        )?;
+        tx.commit()?;
+
         Ok(Self {
             inner: Mutex::new(conn),
         })
+    }
+
+    pub fn upsert_session(
+        &self,
+        task_id: &str,
+        version: &VersionedSession,
+    ) -> anyhow::Result<bool> {
+        let c = self.inner.lock().unwrap();
+        let changed = c.execute(
+            "INSERT INTO sessions(task_id,agent_state,delivery_state,resource_state,public_lifecycle,recovery_substate,desired_json,observed_json,generation,seq,backend_ref,mismatch_count,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(task_id) DO UPDATE SET agent_state=excluded.agent_state,delivery_state=excluded.delivery_state,resource_state=excluded.resource_state,public_lifecycle=excluded.public_lifecycle,recovery_substate=excluded.recovery_substate,desired_json=excluded.desired_json,observed_json=excluded.observed_json,generation=excluded.generation,seq=excluded.seq,backend_ref=excluded.backend_ref,mismatch_count=excluded.mismatch_count,updated_at=excluded.updated_at
+             WHERE excluded.generation > sessions.generation OR (excluded.generation = sessions.generation AND excluded.seq > sessions.seq)",
+            params![task_id, version.agent_state, version.delivery_state, version.resource_state, version.public_lifecycle, version.recovery_substate, version.desired_json, version.observed_json, version.generation, version.seq, version.backend_ref, version.mismatch_count, version.updated_at],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn get_session(&self, task_id: &str) -> anyhow::Result<Option<SessionRecord>> {
+        let c = self.inner.lock().unwrap();
+        let mut st = c.prepare("SELECT task_id,agent_state,delivery_state,resource_state,public_lifecycle,recovery_substate,desired_json,observed_json,generation,seq,backend_ref,mismatch_count,updated_at FROM sessions WHERE task_id=?")?;
+        let mut rows = st.query(params![task_id])?;
+        rows.next()?
+            .map(session_row)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    pub fn list_sessions(&self) -> anyhow::Result<Vec<SessionRecord>> {
+        let c = self.inner.lock().unwrap();
+        let rows = c
+            .prepare("SELECT task_id,agent_state,delivery_state,resource_state,public_lifecycle,recovery_substate,desired_json,observed_json,generation,seq,backend_ref,mismatch_count,updated_at FROM sessions ORDER BY task_id")?
+            .query_map([], session_row)?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn insert_intent<T: Serialize>(
+        &self,
+        op_id: &str,
+        task_id: &str,
+        kind: &str,
+        payload: &T,
+        next_attempt_at: i64,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        let payload_json = json_text(payload)?;
+        let c = self.inner.lock().unwrap();
+        c.execute("INSERT INTO intents(op_id,task_id,kind,payload_json,attempt,next_attempt_at,state,receipt_json,last_error,created_at,updated_at) VALUES(?,?,?, ?,0,?,'pending','','',?,?)", params![op_id,task_id,kind,payload_json,next_attempt_at,now,now]).map(|_| ()).map_err(|e| anyhow!("insert intent {op_id}: {e}"))
+    }
+
+    pub fn claim_intent(&self, now: i64) -> anyhow::Result<Option<IntentRecord>> {
+        let c = self.inner.lock().unwrap();
+        let tx = c.unchecked_transaction()?;
+        let found: Option<String> = tx.query_row("SELECT op_id FROM intents WHERE state='pending' AND next_attempt_at<=? ORDER BY next_attempt_at,created_at LIMIT 1", params![now], |r| r.get(0)).optional()?;
+        let Some(op_id) = found else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        tx.execute("UPDATE intents SET state='claimed',attempt=attempt+1,updated_at=? WHERE op_id=? AND state='pending'", params![now,op_id])?;
+        let record = tx.query_row("SELECT op_id,task_id,kind,payload_json,attempt,next_attempt_at,state,receipt_json,last_error,created_at,updated_at FROM intents WHERE op_id=?", params![op_id], intent_row)?;
+        tx.commit()?;
+        Ok(Some(record))
+    }
+
+    pub fn receipt_intent<T: Serialize>(
+        &self,
+        op_id: &str,
+        receipt: &T,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let c = self.inner.lock().unwrap();
+        let receipt_json = json_text(receipt)?;
+        Ok(c.execute("UPDATE intents SET state='succeeded',receipt_json=?,updated_at=? WHERE op_id=? AND state<>'succeeded'", params![receipt_json,now,op_id])? == 1)
+    }
+
+    pub fn exhaust_intent(&self, op_id: &str, error: &str, now: i64) -> anyhow::Result<bool> {
+        let c = self.inner.lock().unwrap();
+        Ok(c.execute("UPDATE intents SET state='exhausted',last_error=?,updated_at=? WHERE op_id=? AND state<>'succeeded'", params![error,now,op_id])? == 1)
+    }
+
+    pub fn get_intent(&self, op_id: &str) -> anyhow::Result<Option<IntentRecord>> {
+        let c = self.inner.lock().unwrap();
+        let mut st = c.prepare("SELECT op_id,task_id,kind,payload_json,attempt,next_attempt_at,state,receipt_json,last_error,created_at,updated_at FROM intents WHERE op_id=?")?;
+        let mut rows = st.query(params![op_id])?;
+        rows.next()?.map(intent_row).transpose().map_err(Into::into)
+    }
+
+    pub fn list_intents(&self, state: Option<&str>) -> anyhow::Result<Vec<IntentRecord>> {
+        let c = self.inner.lock().unwrap();
+        let mut st = c.prepare("SELECT op_id,task_id,kind,payload_json,attempt,next_attempt_at,state,receipt_json,last_error,created_at,updated_at FROM intents WHERE (? IS NULL OR state=?) ORDER BY created_at, op_id")?;
+        let rows = st
+            .query_map(params![state, state], intent_row)?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// Claim one specific op when it is pending and due. `claim_intent` walks the
+    /// oldest due row (the retry pump's view); a producer that just persisted an
+    /// intent and wants to attempt it immediately needs *this* op claimed, and
+    /// the `state='pending'` guard keeps a concurrent claimer from running it
+    /// twice.
+    pub fn claim_intent_op(&self, op_id: &str, now: i64) -> anyhow::Result<Option<IntentRecord>> {
+        let c = self.inner.lock().unwrap();
+        let taken = c.execute(
+            "UPDATE intents SET state='claimed',attempt=attempt+1,updated_at=? WHERE op_id=? AND state='pending' AND next_attempt_at<=?",
+            params![now, op_id, now],
+        )?;
+        if taken != 1 {
+            return Ok(None);
+        }
+        let record = c.query_row(
+            "SELECT op_id,task_id,kind,payload_json,attempt,next_attempt_at,state,receipt_json,last_error,created_at,updated_at FROM intents WHERE op_id=?",
+            params![op_id],
+            intent_row,
+        )?;
+        Ok(Some(record))
+    }
+
+    /// Return a claimed intent to `pending` with its next backoff slot. Guarded
+    /// on `state='claimed'` so a receipt that landed during the attempt cannot
+    /// be resurrected for another send.
+    pub fn retry_intent(
+        &self,
+        op_id: &str,
+        next_attempt_at: i64,
+        error: &str,
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        let c = self.inner.lock().unwrap();
+        Ok(c.execute(
+            "UPDATE intents SET state='pending',next_attempt_at=?,last_error=?,updated_at=? WHERE op_id=? AND state='claimed'",
+            params![next_attempt_at, error, now, op_id],
+        )? == 1)
+    }
+
+    /// Re-arm a settled intent for another operator round (`repair retry`).
+    /// The attempt counter resets because the retry is a fresh budget request,
+    /// and the guard on the terminal states keeps a live intent's bookkeeping
+    /// untouched.
+    pub fn reset_intent(&self, op_id: &str, now: i64) -> anyhow::Result<bool> {
+        let c = self.inner.lock().unwrap();
+        Ok(c.execute(
+            "UPDATE intents SET state='pending',attempt=0,next_attempt_at=?,receipt_json='',last_error='',updated_at=? WHERE op_id=? AND state IN ('succeeded','exhausted')",
+            params![now, now, op_id],
+        )? == 1)
+    }
+
+    /// One fault row by id. `None` means the id never existed, which is a
+    /// different answer from "already acked" and stays distinguishable.
+    pub fn get_fault(&self, fault_id: i64) -> anyhow::Result<Option<FaultRecord>> {
+        let c = self.inner.lock().unwrap();
+        let mut st = c.prepare(&format!("SELECT {FAULT_COLUMNS} FROM faults WHERE id=?"))?;
+        let mut rows = st.query(params![fault_id])?;
+        rows.next()?.map(fault_row).transpose().map_err(Into::into)
+    }
+
+    /// Operator acknowledgement: `open`/`recovery_created` -> `acked`. The
+    /// `state<>'acked'` guard makes a double ack a reported no-op instead of a
+    /// fresh write, so `repair ack` can tell the operator the truth.
+    pub fn ack_fault(&self, fault_id: i64) -> anyhow::Result<bool> {
+        let c = self.inner.lock().unwrap();
+        Ok(c.execute(
+            "UPDATE faults SET state='acked' WHERE id=? AND state<>'acked'",
+            params![fault_id],
+        )? == 1)
+    }
+
+    /// The last repair stamp written for a task. `None` covers both "the task is
+    /// unknown" and "nobody has repaired it", which are the two answers a
+    /// caller can act on; the column's own empty-string default is neither.
+    pub fn operator_revision(&self, task_id: &str) -> anyhow::Result<Option<String>> {
+        let c = self.inner.lock().unwrap();
+        Ok(c.query_row(
+            "SELECT operator_revision FROM tasks WHERE task_id=?",
+            params![task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .filter(|stamp| !stamp.is_empty()))
+    }
+
+    /// Record one operator repair on the task row. The stamp carries the action
+    /// and its moment, so a later `inspect` shows what a human already did.
+    pub fn bump_operator_revision(
+        &self,
+        task_id: &str,
+        action: &str,
+        now: i64,
+    ) -> anyhow::Result<Option<String>> {
+        let revision = format!("repair {action} at {now}");
+        let c = self.inner.lock().unwrap();
+        let changed = c.execute(
+            "UPDATE tasks SET operator_revision=? WHERE task_id=?",
+            params![revision, task_id],
+        )?;
+        Ok((changed == 1).then(|| revision.clone()))
+    }
+
+    pub fn list_faults(&self, task_id: Option<&str>) -> anyhow::Result<Vec<FaultRecord>> {
+        let c = self.inner.lock().unwrap();
+        let mut st = c.prepare(&format!(
+            "SELECT {FAULT_COLUMNS} FROM faults WHERE (? IS NULL OR task_id=?) ORDER BY id"
+        ))?;
+        let rows = st
+            .query_map(params![task_id, task_id], fault_row)?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn insert_fault(&self, fault: &FaultRecord) -> anyhow::Result<i64> {
+        let c = self.inner.lock().unwrap();
+        c.execute("INSERT INTO faults(task_id,session_id,generation,seq,desired_json,observed_json,intent,attempt,backend_ref,kind,reason,state,recovery_task_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![fault.task_id,fault.session_id,fault.generation,fault.seq,fault.desired_json,fault.observed_json,fault.intent,fault.attempt,fault.backend_ref,fault.kind,fault.reason,fault.state,fault.recovery_task_id,fault.created_at])?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn link_fault_recovery(&self, fault_id: i64, recovery_task_id: &str) -> anyhow::Result<()> {
+        let c = self.inner.lock().unwrap();
+        let tx = c.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE faults SET recovery_task_id=?,state='recovery_created' WHERE id=?",
+            params![recovery_task_id, fault_id],
+        )?;
+        tx.execute(
+            "UPDATE tasks SET kind='recovery',failure_of=? WHERE task_id=?",
+            params![fault_id.to_string(), recovery_task_id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn insert_task(
@@ -274,7 +645,7 @@ impl Db {
         let mut st = c.prepare(
             "WITH RECURSIVE fam(id) AS (
                SELECT ? UNION SELECT task_id FROM tasks, fam WHERE transfer_send_to = fam.id
-             ) SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state
+             ) SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state, kind, failure_of
                FROM tasks WHERE task_id IN fam ORDER BY created_at ASC, rowid ASC",
         )?;
         let mapped = st.query_map(params![task_id], row)?;
@@ -293,7 +664,7 @@ impl Db {
         let limit = filter.limit.clamp(1, 500) as i64;
         let offset = filter.offset.min(i64::MAX as usize) as i64;
         let sql = format!(
-            "SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state \
+            "SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state, kind, failure_of \
              FROM tasks{where_sql} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?"
         );
         let mut row_args = args;
@@ -328,7 +699,7 @@ impl Db {
         let mut st = c.prepare(
             "WITH RECURSIVE fam(id) AS (
                SELECT ? UNION SELECT task_id FROM tasks, fam WHERE transfer_send_to = fam.id
-             ) SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state
+             ) SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state, kind, failure_of
                FROM tasks WHERE task_id IN fam ORDER BY created_at ASC, rowid ASC",
         )?;
         let children = collect_rows(st.query_map(params![task_id], row)?)?
@@ -413,9 +784,65 @@ impl Db {
     }
 }
 
+fn session_row(r: &rusqlite::Row) -> rusqlite::Result<SessionRecord> {
+    Ok(SessionRecord {
+        task_id: r.get(0)?,
+        agent_state: r.get(1)?,
+        delivery_state: r.get(2)?,
+        resource_state: r.get(3)?,
+        public_lifecycle: r.get(4)?,
+        recovery_substate: r.get(5)?,
+        desired_json: r.get(6)?,
+        observed_json: r.get(7)?,
+        generation: r.get(8)?,
+        seq: r.get(9)?,
+        backend_ref: r.get(10)?,
+        mismatch_count: r.get(11)?,
+        updated_at: r.get(12)?,
+    })
+}
+
+const FAULT_COLUMNS: &str = "id,task_id,session_id,generation,seq,desired_json,observed_json,intent,attempt,backend_ref,kind,reason,state,recovery_task_id,created_at";
+
+fn fault_row(r: &rusqlite::Row) -> rusqlite::Result<FaultRecord> {
+    Ok(FaultRecord {
+        id: r.get(0)?,
+        task_id: r.get(1)?,
+        session_id: r.get(2)?,
+        generation: r.get(3)?,
+        seq: r.get(4)?,
+        desired_json: r.get(5)?,
+        observed_json: r.get(6)?,
+        intent: r.get(7)?,
+        attempt: r.get(8)?,
+        backend_ref: r.get(9)?,
+        kind: r.get(10)?,
+        reason: r.get(11)?,
+        state: r.get(12)?,
+        recovery_task_id: r.get(13)?,
+        created_at: r.get(14)?,
+    })
+}
+
+fn intent_row(r: &rusqlite::Row) -> rusqlite::Result<IntentRecord> {
+    Ok(IntentRecord {
+        op_id: r.get(0)?,
+        task_id: r.get(1)?,
+        kind: r.get(2)?,
+        payload_json: r.get(3)?,
+        attempt: r.get(4)?,
+        next_attempt_at: r.get(5)?,
+        state: r.get(6)?,
+        receipt_json: r.get(7)?,
+        last_error: r.get(8)?,
+        created_at: r.get(9)?,
+        updated_at: r.get(10)?,
+    })
+}
+
 fn get_with_conn(c: &Connection, task_id: &str) -> anyhow::Result<Option<TaskRow>> {
     let mut st = c.prepare(
-        "SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state \
+        "SELECT task_id, from_ws, to_ws, transfer_send_to, attempt, state, terminal, payload, out_head, reason, created_at, hop_state, ledger_state, kind, failure_of \
          FROM tasks WHERE task_id=?",
     )?;
     let mut rows = st.query(params![task_id])?;
@@ -488,6 +915,8 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<TaskRow> {
         created_at: r.get(10).unwrap_or_default(),
         hop_state: r.get(11).unwrap_or_default(),
         ledger_state: r.get(12).unwrap_or_default(),
+        kind: r.get(13).unwrap_or("normal".to_string()),
+        failure_of: r.get(14).ok().flatten(),
     })
 }
 
@@ -520,6 +949,233 @@ pub fn append_ledger_line(root: &Path, ev: &LedgerEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The intent helpers the retry pump leans on, each guard exercised on its
+    /// own: a claim that must not land twice, a backoff write from the wrong
+    /// state, a re-arm of a live row, and a receipt that arrives after
+    /// exhaustion. These are the at-least-once invariants, so they are pinned
+    /// one level below the pump that uses them.
+    #[test]
+    fn intent_rows_only_move_from_the_state_their_guard_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        let payload = serde_json::json!({"workspace": "worker", "wire": "---swarm-ctl\n"});
+        db.insert_intent("recycle:a:g1", "a", "recycle", &payload, 100, 100)
+            .unwrap();
+        // A fresh line is pending, unattempted, due at the caller's slot.
+        let fresh = db.get_intent("recycle:a:g1").unwrap().unwrap();
+        assert_eq!(
+            (fresh.state.as_str(), fresh.attempt, fresh.next_attempt_at),
+            ("pending", 0, 100)
+        );
+        assert_eq!(fresh.task_id, "a");
+        assert_eq!(fresh.kind, "recycle");
+        assert!(fresh.payload_json.contains("swarm-ctl"), "{fresh:?}");
+        // A claim by op is atomic and carries the attempt counter with it.
+        let first = db
+            .claim_intent_op("recycle:a:g1", 100)
+            .unwrap()
+            .expect("claim");
+        assert_eq!((first.state.as_str(), first.attempt), ("claimed", 1));
+        assert!(
+            db.claim_intent_op("recycle:a:g1", 100).unwrap().is_none(),
+            "a second claimer must get nothing"
+        );
+        // Claiming the oldest due row skips a claimed line too.
+        assert!(db.claim_intent(500).unwrap().is_none());
+        // Backoff writes only land from `claimed`.
+        assert!(
+            !db.retry_intent("recycle:nothing", 200, "gone", 150)
+                .unwrap(),
+            "an unknown op cannot be scheduled"
+        );
+        assert!(db
+            .retry_intent("recycle:a:g1", 202, "connect refused", 150)
+            .unwrap());
+        let waiting = db.get_intent("recycle:a:g1").unwrap().unwrap();
+        assert_eq!(
+            (
+                waiting.state.as_str(),
+                waiting.attempt,
+                waiting.next_attempt_at
+            ),
+            ("pending", 1, 202)
+        );
+        assert_eq!(waiting.last_error, "connect refused");
+        assert!(db.claim_intent(201).unwrap().is_none(), "not due yet");
+        assert!(db.claim_intent(202).unwrap().is_some(), "due at its slot");
+        assert!(
+            db.claim_intent_op("recycle:a:g1", 202).unwrap().is_none(),
+            "already claimed"
+        );
+        // A receipt outranks everything: neither a retry nor an exhaustion can
+        // undo an accepted send.
+        assert!(db
+            .receipt_intent("recycle:a:g1", &serde_json::json!({"at": 210}), 210)
+            .unwrap());
+        assert!(
+            !db.retry_intent("recycle:a:g1", 300, "late", 220).unwrap(),
+            "a late backoff write must not reopen an answered line"
+        );
+        assert!(
+            !db.exhaust_intent("recycle:a:g1", "late", 230).unwrap(),
+            "a succeeded row cannot be exhausted"
+        );
+        let done = db.get_intent("recycle:a:g1").unwrap().unwrap();
+        assert_eq!(done.state, "succeeded");
+        assert!(done.receipt_json.contains("at"), "{done:?}");
+        // Re-arming is for terminal rows only, and it starts a fresh budget.
+        assert!(db.reset_intent("recycle:a:g1", 300).unwrap());
+        assert!(
+            !db.reset_intent("recycle:nothing", 300).unwrap(),
+            "unknown op"
+        );
+        let rearmed = db.get_intent("recycle:a:g1").unwrap().unwrap();
+        assert_eq!((rearmed.state.as_str(), rearmed.attempt), ("pending", 0));
+        assert!(
+            rearmed.receipt_json.is_empty() && rearmed.last_error.is_empty(),
+            "{rearmed:?}"
+        );
+        // From `pending` again a receipt is writable: that is the pump's own
+        // path after a re-arm.
+        assert!(db
+            .receipt_intent("recycle:a:g1", &serde_json::json!({"at": 310}), 310)
+            .unwrap());
+        assert_eq!(db.list_intents(Some("pending")).unwrap().len(), 0);
+        assert_eq!(db.list_intents(Some("succeeded")).unwrap().len(), 1);
+    }
+
+    /// The supervisor queue's two operator-facing moves — link a recovery, ack
+    /// the fault — are one-shot, and both leave the row readable.
+    #[test]
+    fn fault_rows_link_once_and_ack_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.insert_task("f-1", ".", "worker", "", 1, "payload")
+            .unwrap();
+        let fault = FaultRecord {
+            id: 0,
+            task_id: "f-1".into(),
+            session_id: "f-1".into(),
+            generation: 2,
+            seq: 7,
+            desired_json: "{}".into(),
+            observed_json: "{\"agent\":\"running\"}".into(),
+            intent: "reconcile:probe_dead".into(),
+            attempt: 1,
+            backend_ref: "{\"handle\":\"term-f-1\"}".into(),
+            kind: "probe_dead".into(),
+            reason: "exited".into(),
+            state: "open".into(),
+            recovery_task_id: None,
+            created_at: 10,
+        };
+        let id = db.insert_fault(&fault).unwrap();
+        let stored = db.get_fault(id).unwrap().expect("the row reads back");
+        assert_eq!(
+            (
+                stored.kind.as_str(),
+                stored.state.as_str(),
+                stored.generation,
+                stored.seq
+            ),
+            ("probe_dead", "open", 2, 7)
+        );
+        assert_eq!(stored.observed_json, fault.observed_json);
+        assert_eq!(stored.backend_ref, fault.backend_ref);
+        assert!(
+            db.get_fault(id + 1000).unwrap().is_none(),
+            "an unknown id is not an acked one"
+        );
+        // A task row starts life as ordinary scheduled work.
+        let task = db.get("f-1").unwrap().unwrap();
+        assert_eq!(task.kind, "normal");
+        assert!(task.failure_of.is_none());
+        // Linking a recovery moves both ends of the lineage in one write.
+        db.insert_task("r-1", "worker", ".", "", 1, "recovery report")
+            .unwrap();
+        db.link_fault_recovery(id, "r-1").unwrap();
+        let linked = db.get_fault(id).unwrap().unwrap();
+        assert_eq!(linked.state, "recovery_created");
+        assert_eq!(linked.recovery_task_id.as_deref(), Some("r-1"));
+        let recovery = db.get("r-1").unwrap().unwrap();
+        assert_eq!(recovery.kind, "recovery");
+        assert_eq!(
+            recovery.failure_of.as_deref(),
+            Some(id.to_string().as_str())
+        );
+        assert_eq!(
+            db.get("f-1").unwrap().unwrap().kind,
+            "normal",
+            "the source task keeps its own kind: the lineage runs one way"
+        );
+        // Ack is a one-way door, and a second ack says so instead of lying.
+        assert!(db.ack_fault(id).unwrap());
+        assert_eq!(db.get_fault(id).unwrap().unwrap().state, "acked");
+        assert!(
+            !db.ack_fault(id).unwrap(),
+            "a second ack has nothing left to do"
+        );
+        assert!(!db.ack_fault(id + 1000).unwrap(), "ack of an unknown id");
+        assert_eq!(db.list_faults(Some("f-1")).unwrap().len(), 1);
+        assert_eq!(
+            db.list_faults(None).unwrap().len(),
+            1,
+            "the queue stays readable"
+        );
+    }
+
+    /// `operator_revision` is the only `tasks` column repair writes. It must
+    /// read back what the write reported, and answer honestly for a task that
+    /// does not exist.
+    #[test]
+    fn operator_revision_stamps_the_task_row_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.insert_task("rev-1", ".", "worker", "", 1, "payload")
+            .unwrap();
+        assert_eq!(
+            db.operator_revision("rev-1").unwrap(),
+            None,
+            "an untouched row carries no stamp"
+        );
+        let stamp = db.bump_operator_revision("rev-1", "adopt", 1234).unwrap();
+        assert_eq!(stamp.as_deref(), Some("repair adopt at 1234"));
+        assert_eq!(
+            db.operator_revision("rev-1").unwrap().as_deref(),
+            Some("repair adopt at 1234")
+        );
+        db.bump_operator_revision("rev-1", "close", 2345).unwrap();
+        assert_eq!(
+            db.operator_revision("rev-1").unwrap().as_deref(),
+            Some("repair close at 2345"),
+            "the newest repair is the one an operator reads"
+        );
+        assert!(db
+            .bump_operator_revision("rev-nope", "ack", 1)
+            .unwrap()
+            .is_none());
+        assert_eq!(db.operator_revision("rev-nope").unwrap(), None);
+        // The widened read path must not disturb the ordinary columns.
+        let rows = db.list(None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id, "rev-1");
+        assert!(rows[0].failure_of.is_none());
+        assert_eq!(rows[0].kind, "normal");
+        // The paged history view reads the same widened row, so a TUI page can
+        // show lineage without a second query.
+        let page = db.list_page(&TaskFilter::default()).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].kind, "normal");
+        assert!(page.rows[0].failure_of.is_none());
+        let detail = db
+            .detail("rev-1")
+            .unwrap()
+            .expect("the row has a detail view");
+        assert_eq!(detail.task.kind, "normal");
+        assert!(detail.task.failure_of.is_none());
+    }
+
     #[test]
     fn hop_state_migrates_idempotent_on_old_db() {
         // R4 §6 migration edge: a pre-0.7.0 tasks table without hop_state
@@ -532,7 +1188,11 @@ mod tests {
             conn.execute_batch(
                 "CREATE TABLE tasks(task_id TEXT PRIMARY KEY, from_ws TEXT NOT NULL, to_ws TEXT NOT NULL, transfer_send_to TEXT NOT NULL DEFAULT '', attempt INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL DEFAULT 'pending', terminal TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL DEFAULT '', out_head TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', ledger_state TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0);",
             ).unwrap();
-            conn.execute("INSERT INTO tasks(task_id, from_ws, to_ws) VALUES('old1', '.', 'a')", []).unwrap();
+            conn.execute(
+                "INSERT INTO tasks(task_id, from_ws, to_ws) VALUES('old1', '.', 'a')",
+                [],
+            )
+            .unwrap();
         }
         // Open through a root pointing at this dir: Db::open must add the
         // column without touching existing rows.
@@ -659,24 +1319,18 @@ mod tests {
         db.set_ledger("self", "failed", "", "self reason").unwrap();
 
         let graph = db.graph().unwrap();
-        assert!(
-            graph
-                .by_ws
-                .iter()
-                .any(|row| row.ws == "scout" && row.state == "running" && row.n == 1)
-        );
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.from == "." && edge.to == "scout" && edge.n == 1)
-        );
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.from == "scout" && edge.to == "model" && edge.n == 1)
-        );
+        assert!(graph
+            .by_ws
+            .iter()
+            .any(|row| row.ws == "scout" && row.state == "running" && row.n == 1));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "." && edge.to == "scout" && edge.n == 1));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.from == "scout" && edge.to == "model" && edge.n == 1));
         assert!(!graph.edges.iter().any(|edge| edge.from == edge.to));
 
         let detail = db.detail("child").unwrap().unwrap();
@@ -707,7 +1361,7 @@ mod tests {
     }
 
     #[test]
-    fn old_waiting_schema_is_dropped_not_migrated() {
+    fn unsupported_waiting_schema_fails_fast() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".onlyne/swarm.db");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -717,9 +1371,75 @@ mod tests {
         )
         .unwrap();
         drop(conn);
+        let err = match Db::open(dir.path()) {
+            Ok(_) => panic!("legacy schema unexpectedly opened"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unsupported legacy tasks schema"));
+    }
+
+    #[test]
+    fn protocol_tables_migrate_and_versioned_sessions_are_ordered() {
+        let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path()).unwrap();
-        assert!(db.insert_task("n", ".", "x", "", 1, "p").unwrap());
-        assert_eq!(db.get("n").unwrap().unwrap().transfer_send_to, "");
+        let conn = db.inner.lock().unwrap();
+        for table in ["schema_marker", "sessions", "intents", "faults"] {
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+                    params![table],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+        }
+        drop(conn);
+        let base = VersionedSession {
+            agent_state: "ready".into(),
+            delivery_state: "none".into(),
+            resource_state: "attached".into(),
+            public_lifecycle: "idle".into(),
+            recovery_substate: "".into(),
+            desired_json: "{}".into(),
+            observed_json: "{}".into(),
+            generation: 2,
+            seq: 3,
+            backend_ref: "{}".into(),
+            mismatch_count: 0,
+            updated_at: 10,
+        };
+        assert!(db.upsert_session("t", &base).unwrap());
+        assert!(!db
+            .upsert_session(
+                "t",
+                &VersionedSession {
+                    seq: 2,
+                    ..base.clone()
+                }
+            )
+            .unwrap());
+        assert!(!db.upsert_session("t", &base).unwrap());
+        assert!(db
+            .upsert_session("t", &VersionedSession { seq: 4, ..base })
+            .unwrap());
+    }
+
+    #[test]
+    fn intent_claim_receipt_and_duplicate_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.insert_intent("op", "task", "send", &serde_json::json!({"x": 1}), 1, 0)
+            .unwrap();
+        assert!(db
+            .insert_intent("op", "task", "send", &serde_json::json!({"x": 2}), 1, 0)
+            .is_err());
+        let claimed = db.claim_intent(1).unwrap().unwrap();
+        assert_eq!(claimed.attempt, 1);
+        assert!(db
+            .receipt_intent("op", &serde_json::json!({"ok": true}), 2)
+            .unwrap());
+        assert!(!db.exhaust_intent("op", "late", 3).unwrap());
     }
 
     #[test]

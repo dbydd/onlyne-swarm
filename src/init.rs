@@ -33,6 +33,10 @@ enabled = false
 
 [swarm]
 enabled = true
+
+[swarm.transport]
+mode = "rpc"
+fifo = false
 "#;
 
 pub const ROOT_DOTENV: &str = r#"# Swarm root workspace-local secrets.
@@ -82,8 +86,8 @@ fn write_if_missing(path: &Path, body: &str) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Place `[swarm] enabled = true` into an existing root config.
-/// Returns true when the file was created or modified.
+/// Place `[swarm] enabled = true` and the loopback-RPC transport contract into
+/// an existing root config. Returns true when the file was created or modified.
 fn ensure_swarm_enabled(cfg_path: &Path) -> anyhow::Result<bool> {
     if !cfg_path.exists() {
         if let Some(parent) = cfg_path.parent() {
@@ -93,49 +97,28 @@ fn ensure_swarm_enabled(cfg_path: &Path) -> anyhow::Result<bool> {
         return Ok(true);
     }
     let text = std::fs::read_to_string(cfg_path)?;
-    if text.contains("[swarm]") {
-        let mut out = String::new();
-        let mut in_swarm = false;
-        let mut changed = false;
-        for line in text.lines() {
-            let t = line.trim();
-            if t.starts_with('[') {
-                in_swarm = t == "[swarm]";
-                out.push_str(line);
-                out.push('\n');
-                continue;
-            }
-            if in_swarm && t.starts_with("enabled") {
-                if t != "enabled = true" {
-                    out.push_str("enabled = true\n");
-                    changed = true;
-                } else {
-                    out.push_str(line);
-                    out.push('\n');
-                }
-                continue;
-            }
-            out.push_str(line);
-            out.push('\n');
-        }
-        if changed {
-            std::fs::write(cfg_path, out)?;
-        }
-        return Ok(changed);
+    if text.contains("[swarm.transport]") {
+        // Existing transport settings are supervisor-owned. Initialization only
+        // fills missing contract fields.
+        return Ok(false);
     }
     let mut text = text;
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str("\n[swarm]\nenabled = true\n");
+    if !text.contains("[swarm]") {
+        text.push_str("\n[swarm]\nenabled = true\n");
+    }
+    text.push_str("\n[swarm.transport]\nmode = \"rpc\"\nfifo = false\n");
     std::fs::write(cfg_path, text)?;
     Ok(true)
 }
 
 /// Initialize the current directory as a swarm root.
 ///
-/// - Missing `.onlyne/config.toml` is created loopback-only with swarm on.
-/// - An existing config keeps adapters and secrets; only `[swarm]` flips on.
+/// - Missing `.onlyne/config.toml` is created loopback-only with swarm on and
+///   RPC transport. An existing config keeps adapter, swarm-enable, and
+///   transport values; only missing contract sections are appended.
 /// - Missing schedule starter, root workspace jsonc, and `.env` are created.
 /// - Existing files are never overwritten.
 pub fn run_init(cwd: &Path) -> anyhow::Result<PathBuf> {
@@ -168,6 +151,9 @@ mod tests {
         let cfg = std::fs::read_to_string(root.join(".onlyne/config.toml")).unwrap();
         assert!(cfg.contains("[swarm]"));
         assert!(cfg.contains("enabled = true"));
+        assert!(cfg.contains("[swarm.transport]"));
+        assert!(cfg.contains("mode = \"rpc\""));
+        assert!(cfg.contains("fifo = false"));
         let tpl = std::fs::read_to_string(
             root.join(".agents/.schedule/planner/template.workspace.jsonc"),
         )
@@ -206,10 +192,13 @@ mod tests {
         assert!(cfg.contains("name = \"mine\""));
         assert!(cfg.contains("enabled = true\n\n[swarm]") || cfg.contains("[swarm]"));
         assert!(cfg.contains("[swarm]"));
+        assert!(cfg.contains("[swarm.transport]"));
+        assert!(cfg.contains("mode = \"rpc\""));
+        assert!(cfg.contains("fifo = false"));
     }
 
     #[test]
-    fn init_flips_swarm_off_to_on() {
+    fn init_preserves_supervisor_swarm_disable() {
         let dir = tempfile::tempdir().unwrap();
         let onlyne = dir.path().join(".onlyne");
         std::fs::create_dir_all(&onlyne).unwrap();
@@ -220,7 +209,10 @@ mod tests {
         .unwrap();
         run_init(dir.path()).unwrap();
         let cfg = std::fs::read_to_string(onlyne.join("config.toml")).unwrap();
-        assert!(cfg.contains("enabled = true"));
-        assert!(!cfg.contains("enabled = false"));
+        assert!(cfg.contains("enabled = false"));
+        assert!(!cfg.contains("enabled = true"));
+        assert!(cfg.contains("[swarm.transport]"));
+        assert!(cfg.contains("mode = \"rpc\""));
+        assert!(cfg.contains("fifo = false"));
     }
 }

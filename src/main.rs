@@ -4,10 +4,14 @@ mod events;
 mod hierarchy;
 mod init;
 mod ipc;
+mod lifecycle;
 mod orca;
 mod orca_term;
 mod proto;
+mod reconcile;
+mod repair;
 mod root;
+mod runtime;
 mod sched;
 mod skill;
 mod sync;
@@ -23,10 +27,45 @@ use std::io;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "onlyne-swarm", version, about = "Reactive multi-agent DAG workflow scheduler derived from Onlyne")]
+#[command(
+    name = "onlyne-swarm",
+    version,
+    about = "Reactive multi-agent DAG workflow scheduler derived from Onlyne"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// The seven repair actions, one per `swarm repair <action>`.
+///
+/// Every arm sends the same `{"op":"repair","action":...}` request the socket
+/// serves, so the CLI carries no policy of its own and the scheduler's `ok`
+/// decides the exit code.
+#[derive(Subcommand)]
+enum RepairCmd {
+    /// Show the stored tuple, the live probe, the task row, its faults and its intents
+    Inspect { task_id: String },
+    /// Move the task onto a new Pi generation after proving the old one gone
+    Adopt { task_id: String },
+    /// Supersede the generation with this handle, on the operator's attestation
+    Rebind {
+        task_id: String,
+        #[arg(long)]
+        handle: String,
+    },
+    /// Re-dispatch a fault's recovery task and re-arm its spent intents
+    Retry { task_id: String },
+    /// Settle the work as failed and queue the reason
+    Fail {
+        task_id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Close the resource through the recycle ack path
+    Close { task_id: String },
+    /// Take one fault off the supervisor queue
+    Ack { fault_id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -69,6 +108,9 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Operator repair over a stuck session generation (needs a running scheduler)
+    #[command(subcommand)]
+    Repair(RepairCmd),
     /// List tasks or workspaces
     List {
         /// tasks | workspaces
@@ -84,9 +126,7 @@ enum Cmd {
     /// Open the monitoring TUI (connects to the running scheduler)
     Tui,
     /// Print shell completions (zsh or fish) to stdout
-    ShellCompletions {
-        shell: CompletionShell,
-    },
+    ShellCompletions { shell: CompletionShell },
     /// Manage generated workspace instances
     Workspace {
         #[command(subcommand)]
@@ -141,13 +181,21 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             let report = sync::run_sync(&root_p)?;
-            println!("sync: +{} created, {} orphans, {} dangling links",
-                report.created.len(), report.orphans.len(), report.dangling.len());
+            println!(
+                "sync: +{} created, {} orphans, {} dangling links, {} legacy views",
+                report.created.len(),
+                report.orphans.len(),
+                report.dangling.len(),
+                report.legacy_views.len()
+            );
             for o in &report.orphans {
                 println!("orphan-instance: {o}");
             }
             for d in &report.dangling {
                 println!("dangling-link: {d}");
+            }
+            for v in &report.legacy_views {
+                println!("legacy-view: {v}");
             }
             for h in &report.hierarchy {
                 println!("orca-node: {h}");
@@ -162,8 +210,15 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(p) = root::swarm_pid(&root_p).parent() {
                     let _ = std::fs::create_dir_all(p);
                 }
-                let _ = std::fs::write(root::swarm_pid(&root_p), format!("{}\n", std::process::id()));
-                println!("detached scheduler: pid {} log {}", std::process::id(), root::swarm_log(&root_p).display());
+                let _ = std::fs::write(
+                    root::swarm_pid(&root_p),
+                    format!("{}\n", std::process::id()),
+                );
+                println!(
+                    "detached scheduler: pid {} log {}",
+                    std::process::id(),
+                    root::swarm_log(&root_p).display()
+                );
             } else {
                 println!("onlyne-swarm scheduler running at {}", root_p.display());
                 // R5.4: the scheduler is a foreground process sharing this
@@ -187,8 +242,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Attach | Cmd::Status => {
             let cwd = std::env::current_dir()?;
-            let root_p = root::cwd_root(&cwd);
-            match orca::client_request(&root::swarm_sock(&root_p), serde_json::json!({"id": "cli", "op": "status"})) {
+            let root_p = root::client_root(&cwd);
+            match orca::client_request(
+                &root::swarm_sock(&root_p),
+                serde_json::json!({"id": "cli", "op": "status"}),
+            ) {
                 Ok(v) => {
                     println!("{}", serde_json::to_string_pretty(&v)?);
                     Ok(())
@@ -213,10 +271,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Stop => {
             let cwd = std::env::current_dir()?;
-            let root_p = root::cwd_root(&cwd);
+            let root_p = root::client_root(&cwd);
             let pid_path = root::swarm_pid(&root_p);
             let pid: i32 = match std::fs::read_to_string(&pid_path) {
-                Ok(s) => s.trim().parse().map_err(|_| anyhow::anyhow!("malformed pid file {}", pid_path.display()))?,
+                Ok(s) => s
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("malformed pid file {}", pid_path.display()))?,
                 Err(_) => {
                     println!("no detached scheduler pid at {}", pid_path.display());
                     return Ok(());
@@ -227,7 +288,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Submit { to, payload } => {
             let cwd = std::env::current_dir()?;
-            let root_p = root::cwd_root(&cwd);
+            let root_p = root::client_root(&cwd);
             let text = std::fs::read_to_string(&payload)?;
             let v = orca::client_request(
                 &root::swarm_sock(&root_p),
@@ -236,9 +297,13 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())
         }
-        Cmd::Cancel { task_id, reason, force } => {
+        Cmd::Cancel {
+            task_id,
+            reason,
+            force,
+        } => {
             let cwd = std::env::current_dir()?;
-            let root_p = root::cwd_root(&cwd);
+            let root_p = root::client_root(&cwd);
             let v = orca::client_request(
                 &root::swarm_sock(&root_p),
                 serde_json::json!({"id": "cli", "op": "cancel", "task_id": task_id, "reason": reason, "force": force}),
@@ -246,10 +311,49 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&v)?);
             Ok(())
         }
+        Cmd::Repair(cmd) => {
+            let cwd = std::env::current_dir()?;
+            let root_p = root::client_root(&cwd);
+            let req = match cmd {
+                RepairCmd::Inspect { task_id } => {
+                    serde_json::json!({"id": "cli", "op": "repair", "action": "inspect", "task_id": task_id})
+                }
+                RepairCmd::Adopt { task_id } => {
+                    serde_json::json!({"id": "cli", "op": "repair", "action": "adopt", "task_id": task_id})
+                }
+                RepairCmd::Rebind { task_id, handle } => {
+                    serde_json::json!({"id": "cli", "op": "repair", "action": "rebind", "task_id": task_id, "handle": handle})
+                }
+                RepairCmd::Retry { task_id } => {
+                    serde_json::json!({"id": "cli", "op": "repair", "action": "retry", "task_id": task_id})
+                }
+                RepairCmd::Fail { task_id, reason } => {
+                    serde_json::json!({"id": "cli", "op": "repair", "action": "fail", "task_id": task_id, "reason": reason.unwrap_or_else(|| "operator repair fail".to_string())})
+                }
+                RepairCmd::Close { task_id } => {
+                    serde_json::json!({"id": "cli", "op": "repair", "action": "close", "task_id": task_id})
+                }
+                RepairCmd::Ack { fault_id } => {
+                    serde_json::json!({"id": "cli", "op": "repair", "action": "ack", "fault_id": fault_id})
+                }
+            };
+            let v = orca::client_request(&root::swarm_sock(&root_p), req)?;
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            // The scheduler answered, so its answer decides: a refused action
+            // must not look like a successful one to a shell script.
+            if v.get("ok").and_then(|o| o.as_bool()) != Some(true) {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         Cmd::List { what, state, limit } => {
             let cwd = std::env::current_dir()?;
-            let root_p = root::cwd_root(&cwd);
-            let op = if what == "workspaces" { "list_workspaces" } else { "list_tasks" };
+            let root_p = root::client_root(&cwd);
+            let op = if what == "workspaces" {
+                "list_workspaces"
+            } else {
+                "list_tasks"
+            };
             let v = orca::client_request(
                 &root::swarm_sock(&root_p),
                 serde_json::json!({"id": "cli", "op": op, "state": state, "limit": limit}),
@@ -259,7 +363,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Tui => {
             let cwd = std::env::current_dir()?;
-            let root_p = root::cwd_root(&cwd);
+            let root_p = root::client_root(&cwd);
             tui::run_tui(&root::swarm_sock(&root_p))
         }
         Cmd::ShellCompletions { shell } => {
@@ -313,7 +417,11 @@ fn launch_detached(root_p: &std::path::Path) -> anyhow::Result<()> {
         anyhow::bail!("fork failed: {}", std::io::Error::last_os_error());
     }
     if pid > 0 {
-        println!("scheduler detached (pid file {}); follow {}", root::swarm_pid(root_p).display(), root::swarm_log(root_p).display());
+        println!(
+            "scheduler detached (pid file {}); follow {}",
+            root::swarm_pid(root_p).display(),
+            root::swarm_log(root_p).display()
+        );
         return Ok(());
     }
     // Child: new session, then fork #2 so the session leader can exit and the
@@ -404,10 +512,9 @@ mod cli_tests {
     #[test]
     fn completion_command_is_exposed() {
         let cmd = Cli::command();
-        assert!(
-            cmd.get_subcommands()
-                .any(|sc| sc.get_name() == "shell-completions")
-        );
+        assert!(cmd
+            .get_subcommands()
+            .any(|sc| sc.get_name() == "shell-completions"));
     }
 
     #[test]
@@ -422,6 +529,39 @@ mod cli_tests {
     fn zsh_completion_mentions_swarm() {
         let text = completion_text(Zsh);
         assert!(text.contains("#compdef onlyne-swarm"));
+    }
+
+    /// `repair` is the operator door: all seven actions must be reachable from
+    /// the CLI, and the shells must offer them.
+    #[test]
+    fn repair_exposes_every_action_the_scheduler_serves() {
+        let cmd = Cli::command();
+        let repair = cmd
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "repair")
+            .expect("repair subcommand");
+        let actions: Vec<String> = repair
+            .get_subcommands()
+            .map(|sc| sc.get_name().to_string())
+            .collect();
+        for action in crate::repair::ACTIONS {
+            assert!(
+                actions.iter().any(|a| a == action),
+                "{action} missing: {actions:?}"
+            );
+        }
+        let rebind = repair
+            .get_subcommands()
+            .find(|sc| sc.get_name() == "rebind")
+            .expect("rebind");
+        assert!(
+            rebind
+                .get_arguments()
+                .any(|a| a.get_long() == Some("handle")),
+            "rebind is meaningless without the handle it binds"
+        );
+        let text = completion_text(Zsh);
+        assert!(text.contains("rebind"), "shell completion lost repair");
     }
 
     #[test]
@@ -447,7 +587,11 @@ mod cli_tests {
         std::fs::write(root::swarm_pid(dir.path()), "999999999\n").unwrap();
         assert!(!proc_alive(dir.path()));
         // Our own pid is alive.
-        std::fs::write(root::swarm_pid(dir.path()), format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(
+            root::swarm_pid(dir.path()),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
         assert!(proc_alive(dir.path()));
     }
 

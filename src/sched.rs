@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use crate::runtime::{self, CloseReason, SessionBackend, SessionRef, SpawnSpec};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 /// Scheduler events fanned out to swarm.sock `subscribe` clients and the TUI.
@@ -34,8 +35,13 @@ pub struct Sched {
     pub bus: Arc<Bus>,
     /// Set on shutdown so pump/reaper threads stop reconnecting and exit.
     pub shutdown: Arc<AtomicBool>,
-    /// task_id -> terminal handle for running tasks.
+    /// task_id -> compatibility display handle for running tasks.
     pub terminals: Mutex<HashMap<String, String>>,
+    /// task_id -> opaque backend session reference. The backend owns its shape.
+    pub sessions: Mutex<HashMap<String, SessionRef>>,
+    /// Selected session backend. None records an explicit startup capability fault.
+    pub backend: Option<Arc<dyn SessionBackend>>,
+    pub backend_error: Option<String>,
     /// workspace path -> idle ready terminal handles (transient pool).
     pub idle: Mutex<HashMap<String, Vec<IdleTerminal>>>,
     /// task_id -> successful FIFO delivery time. Dead-terminal detection waits
@@ -46,6 +52,10 @@ pub struct Sched {
     pub hop_since: Mutex<HashMap<String, (String, std::time::Instant)>>,
     /// R4: task_id -> last hop_overlong emit. Drives the CR6 repeat policy.
     pub overlong_last: Mutex<HashMap<String, std::time::Instant>>,
+    /// task_id -> terminal handle reserved by the scheduler before Orca
+    /// create returns. A pane can emit swarm_ready during create; this
+    /// reservation lets on_ready match it instead of parking the pane.
+    pub awaiting_ready: Mutex<std::collections::HashSet<String>>,
     /// R4 (CR3): tasks idle while the hop still awaits `swarm_complete`.
     /// The plugin owns the exit reminder and the auto-quit for these, so
     /// the scheduler records + displays them and never fails them by TTL.
@@ -65,18 +75,46 @@ pub struct IdleTerminal {
 
 impl Sched {
     pub fn new(root: PathBuf, db: crate::db::Db) -> Arc<Self> {
+        let (backend, backend_error) = match runtime::default_backend() {
+            Ok(backend) => (Some(Arc::from(backend)), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        Self::new_with_backend(root, db, backend, backend_error)
+    }
+
+    pub fn new_with_backend(
+        root: PathBuf,
+        db: crate::db::Db,
+        backend: Option<Arc<dyn SessionBackend>>,
+        backend_error: Option<String>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             root,
             db,
             bus: Arc::new(Bus::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
             terminals: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            backend,
+            backend_error,
             idle: Mutex::new(HashMap::new()),
             running_since: Mutex::new(HashMap::new()),
             hop_since: Mutex::new(HashMap::new()),
             overlong_last: Mutex::new(HashMap::new()),
+            awaiting_ready: Mutex::new(std::collections::HashSet::new()),
             idle_pending_exit: Mutex::new(std::collections::HashSet::new()),
             alerts: Mutex::new(std::collections::VecDeque::new()),
+        })
+    }
+
+    pub fn require_backend(&self) -> anyhow::Result<Arc<dyn SessionBackend>> {
+        self.backend.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "scheduler has no usable session backend: {}",
+                self.backend_error
+                    .as_deref()
+                    .unwrap_or("backend selection failed")
+            )
         })
     }
 
@@ -121,8 +159,8 @@ impl Sched {
     /// role, idle 60. `ready` (delivery write) is a fixed 30s, not
     /// configurable (a stuck FIFO write means the daemon is dead).
     pub fn timeout_secs(&self, key: &str) -> u64 {
-        let raw = std::fs::read_to_string(crate::root::swarm_ws_config(&self.root))
-            .unwrap_or_default();
+        let raw =
+            std::fs::read_to_string(crate::root::swarm_ws_config(&self.root)).unwrap_or_default();
         let v: serde_json::Value = crate::template::parse_lenient(&raw).unwrap_or_default();
         v.get("timeouts")
             .and_then(|t| t.get(key))
@@ -136,8 +174,8 @@ impl Sched {
 
     /// R4 per-role busy (long-run) cap in seconds. None = unlimited.
     pub fn busy_limit_secs(&self, role: &str) -> Option<u64> {
-        let raw = std::fs::read_to_string(crate::root::swarm_ws_config(&self.root))
-            .unwrap_or_default();
+        let raw =
+            std::fs::read_to_string(crate::root::swarm_ws_config(&self.root)).unwrap_or_default();
         let v: serde_json::Value = crate::template::parse_lenient(&raw).unwrap_or_default();
         v.get("timeouts")
             .and_then(|t| t.get("busy_secs"))
@@ -163,14 +201,9 @@ pub fn submit(
         anyhow::bail!("unknown workspace: {to}");
     }
     let task_id = uuid::Uuid::new_v4().to_string();
-    let inserted = sched.db.insert_task(
-        &task_id,
-        from,
-        to,
-        "",
-        1,
-        payload_markdown,
-    )?;
+    let inserted = sched
+        .db
+        .insert_task(&task_id, from, to, "", 1, payload_markdown)?;
     if !inserted {
         anyhow::bail!("duplicate task_id: {task_id}");
     }
@@ -191,12 +224,7 @@ pub fn dispatch_public(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::R
 
 /// R4 hop transition helper: persist hop_state + in-memory since + emit.
 /// `hop_since` tracks (state, entered_at) for TUI dwell display.
-fn set_hop(
-    sched: &Arc<Sched>,
-    task_id: &str,
-    from: &str,
-    to: &str,
-) -> anyhow::Result<()> {
+fn set_hop(sched: &Arc<Sched>, task_id: &str, from: &str, to: &str) -> anyhow::Result<()> {
     sched.db.set_hop(task_id, to)?;
     sched
         .hop_since
@@ -221,6 +249,12 @@ fn current_hop(sched: &Arc<Sched>, task_id: &str) -> String {
 }
 
 fn dispatch(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::Result<()> {
+    // Reserve the handshake before creating the pane. Orca can launch pi and
+    // pi-onlyne can emit swarm_ready before terminal create returns; without
+    // this reservation that ready is parked as an idle pane and the task
+    // reaches the dispatched timeout with zero delivery.
+    sched.awaiting_ready.lock().unwrap().insert(task_id.into());
+    let _ = set_hop(sched, task_id, "", "dispatched");
     // 1. Try idle pool (same workspace path affinity). A reused pane is
     // already ready with payload written inline: straight to busy (R4 §3).
     let idle_handle = sched
@@ -231,6 +265,7 @@ fn dispatch(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::Result<()> {
         .and_then(|v| v.pop())
         .map(|t| t.handle);
     if let Some(handle) = idle_handle {
+        sched.awaiting_ready.lock().unwrap().remove(task_id);
         deliver_to_terminal(sched, task_id, to, &handle)?;
         return Ok(());
     }
@@ -239,19 +274,50 @@ fn dispatch(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::Result<()> {
     // loopback/in into the session's followUp task queue.
     let ws = crate::root::resolve_instance(&sched.root, to);
     let title = format!("swarm:{to}:{task_id_short}", task_id_short = &task_id[..8]);
-    let term = crate::orca_term::create(&title, &ws, task_id)?;
+    let session = if std::env::var("SWARM_STUB_AGENT").as_deref() == Ok("1") {
+        SessionRef {
+            task_id: task_id.into(),
+            backend: "stub".into(),
+            backend_ref: serde_json::json!({"handle": format!("stub-{title}-{task_id}")}),
+            generation: 1,
+        }
+    } else {
+        let backend = sched.require_backend()?;
+        backend.spawn(SpawnSpec {
+            cwd: ws.clone(),
+            task_id: task_id.into(),
+            command: vec!["pi".into()],
+            env: BTreeMap::from([("ONLYNE_SWARM_TASK".into(), task_id.into())]),
+            focus: Some(false),
+            rename: Some(title),
+        })?
+    };
+    let handle = session_display_handle(&session);
+    sched
+        .sessions
+        .lock()
+        .unwrap()
+        .insert(task_id.into(), session.clone());
     sched
         .terminals
         .lock()
         .unwrap()
-        .insert(task_id.into(), term.handle.clone());
-    sched.db.set_terminal(task_id, &term.handle)?;
-    sched.db
-        .set_state(task_id, crate::db::TaskState::Running)?;
-    let _ = set_hop(sched, task_id, "", "dispatched");
+        .insert(task_id.into(), handle.clone());
+    sched
+        .db
+        .set_terminal(task_id, &serde_json::to_string(&session)?)?;
+    // Seed the session ledger the moment dispatch proves the binding: created
+    // + resource attached. Even if the ready event is later lost, a boot-time
+    // reconcile can adopt this generation instead of treating it as orphaned.
+    crate::reconcile::feed_dispatched(sched, task_id);
+    // Catch a ready written while the event subscription was reconnecting.
+    // The returned handle is the only replay key: an old ready from the same
+    // workspace cannot claim this task.
+    crate::events::replay_ready_history(sched, to, &crate::root::onlyne_sock(&ws), Some(&handle));
+    sched.db.set_state(task_id, crate::db::TaskState::Running)?;
     sched.emit(
         "task_running",
-        serde_json::json!({"task_id": task_id, "to": to, "terminal_handle": term.handle}),
+        serde_json::json!({"task_id": task_id, "to": to, "terminal_handle": handle}),
     );
     Ok(())
 }
@@ -265,17 +331,27 @@ fn dispatch(sched: &Arc<Sched>, task_id: &str, to: &str) -> anyhow::Result<()> {
 /// handle — dispatch records it at create time and orca exposes the same value
 /// as ORCA_TERMINAL_HANDLE inside the terminal. Only fall back to path-based
 /// matching for handles we never created (manual sessions, empty env).
-pub fn on_ready(
-    sched: &Arc<Sched>,
-    workspace: &str,
-    terminal_handle: &str,
-) -> anyhow::Result<()> {
+pub fn on_ready(sched: &Arc<Sched>, workspace: &str, terminal_handle: &str) -> anyhow::Result<()> {
     let rows = sched.db.list(None, 200)?;
+    let awaiting = sched.awaiting_ready.lock().unwrap();
     let terminals = sched.terminals.lock().unwrap();
-    let candidate = match_candidate(&rows, &terminals, workspace, terminal_handle);
+    let already_bound = !terminal_handle.is_empty()
+        && terminals
+            .iter()
+            .find(|(_, handle)| handle.as_str() == terminal_handle)
+            .map(|(task_id, _)| !awaiting.contains(task_id))
+            .unwrap_or(false);
+    let candidate = match_candidate(&rows, &awaiting, &terminals, workspace, terminal_handle);
+    drop(awaiting);
     drop(terminals);
+    if already_bound {
+        // The terminal already completed its ready handshake. History replay
+        // and a duplicate daemon event are both safe no-ops.
+        return Ok(());
+    }
     match candidate {
         Some(task_id) => {
+            sched.awaiting_ready.lock().unwrap().remove(&task_id);
             sched
                 .terminals
                 .lock()
@@ -290,13 +366,25 @@ pub fn on_ready(
             // Re-assert the swarm title: pi overwrites the create-time title
             // on boot, so without this the tab shows a generic pi title.
             // Best effort; a failed rename must not fail the delivery.
-            let title =
-                format!("swarm:{}:{}", workspace, &task_id[..8.min(task_id.len())]);
-            let _ = crate::orca_term::rename(terminal_handle, &title);
+            let title = format!("swarm:{}:{}", workspace, &task_id[..8.min(task_id.len())]);
+            if let Some(session) = session_for_handle(sched, &task_id, terminal_handle) {
+                let _ = sched
+                    .require_backend()
+                    .and_then(|backend| backend.rename(&session, &title));
+            }
+            // Lifecycle projection: the agent is reachable. feed_created covers
+            // a ready-pool/manual session that never went through dispatch; it
+            // is a no-op once the row exists. turn_started then comes from the
+            // hop activity report.
+            let _ = crate::reconcile::feed_created(sched, &task_id);
+            let _ = crate::reconcile::feed_ready(sched, &task_id);
             Ok(())
         }
         None => {
-            // No pending task: park in the transient idle pool (60s TTL reaped elsewhere).
+            // No matching reservation: this is a clean ready pane with no
+            // task yet. Keep the existing 60s idle-pool behavior. A stale
+            // ready from a previous task is harmless here because reuse
+            // writes the new task payload before the pane enters busy.
             sched
                 .idle
                 .lock()
@@ -330,7 +418,10 @@ pub fn on_hop_activity(
         | crate::db::TaskState::Cancelled
         | crate::db::TaskState::Closed => {
             sched.note_alert(format!(
-                "dropped-out: {} {}", &task_id[..8.min(task_id.len())], task.state.as_str()));
+                "dropped-out: {} {}",
+                &task_id[..8.min(task_id.len())],
+                task.state.as_str()
+            ));
             sched.emit(
                 "out_for_terminal_task_dropped",
                 serde_json::json!({"task_id": task_id, "state": task.state.as_str()}),
@@ -351,18 +442,30 @@ pub fn on_hop_activity(
         sched.idle_pending_exit.lock().unwrap().remove(task_id);
         // A busy report proves liveness: refresh the delivery clock so the
         // dead-terminal sweep cannot reap a working session.
-        sched.running_since.lock().unwrap().insert(task_id.into(), std::time::Instant::now());
+        sched
+            .running_since
+            .lock()
+            .unwrap()
+            .insert(task_id.into(), std::time::Instant::now());
+        // Lifecycle: a busy report is the `working` evidence (TurnStarted).
+        let _ = crate::reconcile::feed_turn_started(sched, task_id);
     } else {
         if cur == "idle" {
             return Ok(()); // duplicate idle: display heartbeat only, clock untouched
         }
         let _ = pending_exit; // reminder actor stays plugin-local (CR3); scheduler only records
         if pending_exit {
-            sched.idle_pending_exit.lock().unwrap().insert(task_id.into());
+            sched
+                .idle_pending_exit
+                .lock()
+                .unwrap()
+                .insert(task_id.into());
         } else {
             sched.idle_pending_exit.lock().unwrap().remove(task_id);
         }
         set_hop(sched, task_id, &cur, "idle")?;
+        // Lifecycle: an idle report is the turn ending with no receipt yet.
+        let _ = crate::reconcile::feed_turn_ended(sched, task_id);
     }
     Ok(())
 }
@@ -371,6 +474,7 @@ pub fn on_hop_activity(
 /// so the race contract is unit-tested without a database.
 fn match_candidate(
     rows: &[crate::db::TaskRow],
+    awaiting: &std::collections::HashSet<String>,
     terminals: &HashMap<String, String>,
     workspace: &str,
     terminal_handle: &str,
@@ -379,11 +483,10 @@ fn match_candidate(
     // busy row retains its terminal handle for adoption, yet must never
     // steal a later ready event for another task.
     let waiting = |r: &crate::db::TaskRow| {
-        matches!(r.hop_state.as_str(), "" | "dispatched" | "ready")
+        matches!(r.hop_state.as_str(), "" | "dispatched" | "ready") || awaiting.contains(&r.task_id)
     };
     let eligible = |r: &crate::db::TaskRow| {
-        (r.state == crate::db::TaskState::Pending
-            || r.state == crate::db::TaskState::Running)
+        (r.state == crate::db::TaskState::Pending || r.state == crate::db::TaskState::Running)
             && r.to_ws == workspace
             && waiting(r)
     };
@@ -427,16 +530,24 @@ fn deliver_to_terminal(
         attempt: task.attempt,
     };
     let wire = crate::proto::render(&header, &role, &task.payload);
-    write_loopback_in(&crate::root::resolve_instance(&sched.root, to), &wire)?;
-    sched.running_since.lock().unwrap().insert(task_id.into(), std::time::Instant::now());
+    crate::ipc::send_loopback_rpc(
+        sched,
+        task_id,
+        &crate::root::resolve_instance(&sched.root, to),
+        &wire,
+    )?;
+    sched
+        .running_since
+        .lock()
+        .unwrap()
+        .insert(task_id.into(), std::time::Instant::now());
     sched.db.set_terminal(task_id, handle)?;
     sched
         .terminals
         .lock()
         .unwrap()
         .insert(task_id.into(), handle.into());
-    sched.db
-        .set_state(task_id, crate::db::TaskState::Running)?;
+    sched.db.set_state(task_id, crate::db::TaskState::Running)?;
     // R4: payload written => busy (covers fresh dispatch via on_ready and
     // idle-pool reuse straight from dispatch).
     let from = current_hop(sched, task_id);
@@ -444,19 +555,54 @@ fn deliver_to_terminal(
     Ok(())
 }
 
-fn write_loopback_in(ws: &std::path::Path, text: &str) -> anyhow::Result<()> {
-    // `in` is a real FIFO owned by the workspace daemon: open-write-close
-    // delivers one message (EOF ends the message). Never create it here.
-    // Fire-and-forget per hop: no cross-hop write lock (amendment-1 removes
-    // the callback path that made coalesced writes fatal).
-    use std::io::Write;
-    let p = crate::root::loopback_in(ws);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&p)?;
-    f.write_all(text.as_bytes())?;
-    f.flush()?;
-    Ok(())
+pub(crate) fn session_display_handle(session: &SessionRef) -> String {
+    session
+        .backend_ref
+        .get("handle")
+        .and_then(|v| v.as_str())
+        .or_else(|| session.backend_ref.get("id").and_then(|v| v.as_str()))
+        .or_else(|| session.backend_ref.get("session").and_then(|v| v.as_str()))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+pub(crate) fn session_for_handle(
+    sched: &Arc<Sched>,
+    task_id: &str,
+    handle: &str,
+) -> Option<SessionRef> {
+    if let Some(session) = sched.sessions.lock().unwrap().get(task_id).cloned() {
+        if session.task_id == task_id {
+            return Some(session);
+        }
+    }
+    let row = sched.db.get(task_id).ok().flatten()?;
+    if let Ok(session) = serde_json::from_str::<SessionRef>(&row.terminal) {
+        if session.task_id == task_id {
+            return Some(session);
+        }
+    }
+    let backend = sched.backend.as_ref()?.name().to_owned();
+    Some(SessionRef {
+        task_id: task_id.into(),
+        backend,
+        backend_ref: serde_json::json!({"handle": handle}),
+        generation: 1,
+    })
+}
+
+pub(crate) fn session_alive(sched: &Arc<Sched>, task_id: &str, handle: &str) -> bool {
+    if handle.is_empty() || handle.starts_with("stub-") {
+        return true;
+    }
+    let Some(session) = session_for_handle(sched, task_id, handle) else {
+        return true;
+    };
+    sched
+        .require_backend()
+        .and_then(|backend| backend.probe(&session))
+        .map(|probe| probe.alive)
+        .unwrap_or(true)
 }
 
 /// A handoff that starts with the canonical failure marker carries useful
@@ -495,7 +641,10 @@ pub fn on_out(
         | crate::db::TaskState::Cancelled
         | crate::db::TaskState::Closed => {
             sched.note_alert(format!(
-                "dropped-out: {} {}", &task_id[..8.min(task_id.len())], task.state.as_str()));
+                "dropped-out: {} {}",
+                &task_id[..8.min(task_id.len())],
+                task.state.as_str()
+            ));
             sched.emit(
                 "out_for_terminal_task_dropped",
                 serde_json::json!({"task_id": task_id, "from": from_ws, "state": task.state.as_str()}),
@@ -519,7 +668,9 @@ pub fn on_out(
         ""
     };
     sched.db.set_state(task_id, terminal_state)?;
-    sched.db.set_ledger(task_id, ledger_state, &out_head, reason)?;
+    sched
+        .db
+        .set_ledger(task_id, ledger_state, &out_head, reason)?;
     crate::db::append_ledger_line(
         &sched.root,
         &crate::db::LedgerEvent {
@@ -543,6 +694,15 @@ pub fn on_out(
             serde_json::json!({"task_id": task_id, "from": from_ws}),
         );
     }
+    // Lifecycle: a completed handoff opens + receives the completion intent and
+    // mirrors `done`; a `> hop-failed` handoff fails the session. This runs
+    // before the resource close so the tuple is settled (feed_delivered) and
+    // close_terminal's ack lands on a legal state.
+    if failed {
+        let _ = crate::reconcile::feed_fail(sched, task_id);
+    } else {
+        let _ = crate::reconcile::feed_delivered(sched, task_id);
+    }
     close_terminal(sched, task_id)?;
     if !failed {
         sched.db.set_state(task_id, crate::db::TaskState::Closed)?;
@@ -558,9 +718,7 @@ pub fn on_early_exit(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow:
     let Some(task) = sched.db.get(task_id)? else {
         return Ok(());
     };
-    if task.state == crate::db::TaskState::Done
-        || task.state == crate::db::TaskState::Closed
-    {
+    if task.state == crate::db::TaskState::Done || task.state == crate::db::TaskState::Closed {
         return Ok(());
     }
     sched.db.set_state(task_id, crate::db::TaskState::Failed)?;
@@ -581,6 +739,9 @@ pub fn on_early_exit(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow:
         "task_failed",
         serde_json::json!({"task_id": task_id, "to": task.to_ws, "reason": reason}),
     );
+    // Lifecycle: the scheduler gave up on this work (dispatch error, timeout,
+    // lost terminal). Fail the session; the close below finalizes the generation.
+    let _ = crate::reconcile::feed_fail(sched, task_id);
     close_terminal(sched, task_id)?;
     Ok(())
 }
@@ -596,16 +757,21 @@ pub fn cancel(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::Result
 
 /// Cancel with the manual escape hatch: `force` runs the task-scoped pkill
 /// inside each tab before closing it. Off the default path.
-pub fn cancel_force(sched: &Arc<Sched>, task_id: &str, reason: &str, force: bool) -> anyhow::Result<Vec<String>> {
+pub fn cancel_force(
+    sched: &Arc<Sched>,
+    task_id: &str,
+    reason: &str,
+    force: bool,
+) -> anyhow::Result<Vec<String>> {
     let fam = sched.db.family(task_id)?;
     let mut out = vec![];
     for t in &fam {
-        if t.state == crate::db::TaskState::Closed
-            || t.state == crate::db::TaskState::Cancelled
-        {
+        if t.state == crate::db::TaskState::Closed || t.state == crate::db::TaskState::Cancelled {
             continue;
         }
-        sched.db.set_state(&t.task_id, crate::db::TaskState::Cancelled)?;
+        sched
+            .db
+            .set_state(&t.task_id, crate::db::TaskState::Cancelled)?;
         sched.db.set_ledger(&t.task_id, "cancelled", "", reason)?;
         crate::db::append_ledger_line(
             &sched.root,
@@ -622,6 +788,8 @@ pub fn cancel_force(sched: &Arc<Sched>, task_id: &str, reason: &str, force: bool
         if force {
             force_kill(sched, &t.task_id);
         }
+        // Lifecycle: operator cancel settles the result and proceeds to exit.
+        let _ = crate::reconcile::feed_cancel(sched, &t.task_id);
         close_terminal(sched, &t.task_id)?;
         out.push(t.task_id.clone());
         sched.emit(
@@ -640,6 +808,10 @@ pub fn on_recycled(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::R
     let Some(task) = sched.db.get(task_id)? else {
         return Ok(());
     };
+    // Lifecycle: the worker's tab is being reclaimed. The resource-close event
+    // is legal in both branches (a settled Done closes the generation; a
+    // still-owed session is failed by the reconcile ladder, not here).
+    let _ = crate::reconcile::feed_resource_closed(sched, task_id);
     if task.state == crate::db::TaskState::Done
         || task.state == crate::db::TaskState::Closed
         || task.state == crate::db::TaskState::Cancelled
@@ -699,13 +871,16 @@ pub fn on_recycled(sched: &Arc<Sched>, task_id: &str, reason: &str) -> anyhow::R
 /// Remove the tracked tab and close it. The session has already accepted a
 /// recycle/quit, so this must not send another downlink control message.
 fn close_tab_only(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
+    sched.awaiting_ready.lock().unwrap().remove(task_id);
     sched.running_since.lock().unwrap().remove(task_id);
     sched.hop_since.lock().unwrap().remove(task_id);
     let _ = sched.db.set_hop(task_id, "");
     let handle = sched.terminals.lock().unwrap().remove(task_id);
     if let Some(h) = handle {
-        if !h.starts_with("stub-") {
-            let _ = crate::orca_term::close(&h);
+        if let Some(session) = session_for_handle(sched, task_id, &h) {
+            let _ = sched
+                .require_backend()
+                .and_then(|backend| backend.close(&session, CloseReason::Completed, false));
         }
     }
     Ok(())
@@ -715,12 +890,13 @@ fn close_tab_only(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
 /// Ownership (amendment 3): the session dies by its own hand — the scheduler
 /// sends the downlink signal, waits briefly for the `swarm_recycled` ack,
 /// then closes the Orca tab regardless. No shell injection on this path.
+///
+/// The send itself belongs to `reconcile`: the control frame is persisted as an
+/// intent before it touches the socket, so a daemon that dies between the
+/// decision and the write leaves a `pending` row for the retry pump instead of
+/// a session that never learns it was told to close.
 fn signal_recycle(sched: &Arc<Sched>, task_id: &str, reason: &str) {
-    let task = sched.db.get(task_id).ok().flatten();
-    let to = task.map(|t| t.to_ws).unwrap_or_default();
-    let to = if to.is_empty() { ".".into() } else { to };
-    let ws = crate::root::resolve_instance(&sched.root, &to);
-    let _ = write_loopback_in(&ws, &crate::proto::render_ctl(task_id, reason));
+    crate::reconcile::request_recycle(sched, task_id, reason);
 }
 
 /// Wait up to `timeout` for the session's `swarm_recycled` ack, polling the
@@ -761,7 +937,11 @@ fn daemon_history(sock: &std::path::Path, limit: usize) -> anyhow::Result<Vec<St
     let mut out = String::new();
     r.read_line(&mut out)?;
     let v: serde_json::Value = serde_json::from_str(&out)?;
-    let items = v.pointer("/data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+    let items = v
+        .pointer("/data")
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
     Ok(items
         .iter()
         .filter_map(|m| m.get("text").and_then(|t| t.as_str()).map(String::from))
@@ -775,31 +955,34 @@ fn daemon_history(sock: &std::path::Path, limit: usize) -> anyhow::Result<Vec<St
 fn force_kill(sched: &Arc<Sched>, task_id: &str) {
     let handle = sched.terminals.lock().unwrap().get(task_id).cloned();
     if let Some(h) = handle {
-        if !h.starts_with("stub-") {
-            let _ = crate::orca_term::close(&h);
+        if let Some(session) = session_for_handle(sched, task_id, &h) {
+            let _ = sched
+                .require_backend()
+                .and_then(|backend| backend.close(&session, CloseReason::Operator, true));
         }
     }
 }
 
 fn close_terminal(sched: &Arc<Sched>, task_id: &str) -> anyhow::Result<()> {
+    sched.awaiting_ready.lock().unwrap().remove(task_id);
     sched.running_since.lock().unwrap().remove(task_id);
     sched.hop_since.lock().unwrap().remove(task_id);
     // R4: terminal rows carry no hop substate.
     let _ = sched.db.set_hop(task_id, "");
     let handle = sched.terminals.lock().unwrap().remove(task_id);
     if let Some(h) = handle {
-        if h.starts_with("stub-") {
-            return Ok(());
-        }
         // Reclaim protocol: signal, wait briefly for the ack, close the tab
         // regardless. The session exits its own process; the scheduler only
-        // ever touches the Orca tab object. No shell injection here —
-        // kill_pi_for_task is operator-only (cancel --force).
+        // ever touches the backend session object.
         signal_recycle(sched, task_id, "close");
         if !wait_recycled_ack(sched, task_id, std::time::Duration::from_secs(5)) {
             tracing::warn!(task = %task_id, handle = %h, "recycle_no_ack");
         }
-        let _ = crate::orca_term::close(&h);
+        if let Some(session) = session_for_handle(sched, task_id, &h) {
+            let _ = sched
+                .require_backend()
+                .and_then(|backend| backend.close(&session, CloseReason::Completed, false));
+        }
     }
     Ok(())
 }
@@ -812,8 +995,7 @@ mod sched_tests {
     fn test_sched() -> Arc<Sched> {
         let dir = tempfile::tempdir().unwrap();
         // Db::open borrows root; keep dir alive via leak for test simplicity.
-        let root: &'static std::path::Path =
-            Box::leak(dir.path().join("root").into_boxed_path());
+        let root: &'static std::path::Path = Box::leak(dir.path().join("root").into_boxed_path());
         std::fs::create_dir_all(root).unwrap();
         // Leak dir too so the tempdir is not deleted mid-test.
         let _ = Box::leak(Box::new(dir));
@@ -873,7 +1055,9 @@ mod sched_tests {
         assert!(task.out_head.starts_with("> hop-failed:"));
         assert!(task.reason.contains("handoff declares hop-failed"));
         let tail = s.db.ledger(10).unwrap();
-        assert!(tail.iter().any(|row| row.task_id == "fh1" && row.state == "failed"));
+        assert!(tail
+            .iter()
+            .any(|row| row.task_id == "fh1" && row.state == "failed"));
     }
 
     #[test]
@@ -940,7 +1124,9 @@ mod sched_tests {
         let t = s.db.get("quit1").unwrap().unwrap();
         assert_eq!(t.state, TaskState::Failed);
         let tail = s.db.ledger(10).unwrap();
-        assert!(tail.iter().any(|e| e.task_id == "quit1" && e.reason.contains("swarm-recycled")));
+        assert!(tail
+            .iter()
+            .any(|e| e.task_id == "quit1" && e.reason.contains("swarm-recycled")));
     }
 
     #[test]
@@ -949,21 +1135,53 @@ mod sched_tests {
         let s = test_sched();
         seed(&s, "own", "a", "", TaskState::Running);
         seed(&s, "other", "a", "", TaskState::Running);
-        s.terminals.lock().unwrap().insert("own".into(), "term-OWN".into());
-        s.terminals.lock().unwrap().insert("other".into(), "term-OTHER".into());
-        s.hop_since.lock().unwrap().insert("own".into(), ("dispatched".into(), std::time::Instant::now()));
-        s.hop_since.lock().unwrap().insert("other".into(), ("dispatched".into(), std::time::Instant::now()));
+        s.terminals
+            .lock()
+            .unwrap()
+            .insert("own".into(), "term-OWN".into());
+        s.terminals
+            .lock()
+            .unwrap()
+            .insert("other".into(), "term-OTHER".into());
+        s.hop_since.lock().unwrap().insert(
+            "own".into(),
+            ("dispatched".into(), std::time::Instant::now()),
+        );
+        s.hop_since.lock().unwrap().insert(
+            "other".into(),
+            ("dispatched".into(), std::time::Instant::now()),
+        );
         // The rows list newest-first; path-only matching would pick "other".
         // Handle-first matching must pick the task whose terminal we created.
         let rows = s.db.list(None, 200).unwrap();
         let terminals = s.terminals.lock().unwrap();
-        let hit = match_candidate(&rows, &terminals, "a", "term-OWN");
+        let awaiting = std::collections::HashSet::new();
+        let hit = match_candidate(&rows, &awaiting, &terminals, "a", "term-OWN");
         assert_eq!(hit.as_deref(), Some("own"));
         // Unknown handle falls back to path matching without panic.
-        let hit = match_candidate(&rows, &terminals, "a", "term-STRANGER");
+        let hit = match_candidate(&rows, &awaiting, &terminals, "a", "term-STRANGER");
         assert!(hit == Some("own".into()) || hit == Some("other".into()));
         // Wrong workspace matches nothing.
-        assert_eq!(match_candidate(&rows, &terminals, "b", "term-OWN"), None);
+        assert_eq!(
+            match_candidate(&rows, &awaiting, &terminals, "b", "term-OWN"),
+            None
+        );
+    }
+
+    #[test]
+    fn ready_matches_reserved_task_before_create_returns() {
+        let s = test_sched();
+        seed(&s, "reserved", "a", "", TaskState::Pending);
+        s.awaiting_ready.lock().unwrap().insert("reserved".into());
+        let rows = s.db.list(None, 200).unwrap();
+        let awaiting = s.awaiting_ready.lock().unwrap();
+        let terminals = s.terminals.lock().unwrap();
+        // No terminal handle has been returned by Orca yet. Reservation alone
+        // must make the path match eligible for an early swarm_ready.
+        assert_eq!(
+            match_candidate(&rows, &awaiting, &terminals, "a", "term-early").as_deref(),
+            Some("reserved")
+        );
     }
 
     #[test]
@@ -977,12 +1195,28 @@ mod sched_tests {
             serde_json::json!({"task_id": "model-task-abcdefgh", "to_ws": "model", "state": "running", "terminal": "term_model"}),
         ];
         let graph = serde_json::json!({"by_ws": [], "edges": []});
-        let layout = crate::tui::build_graph_layout(&workspaces, &tasks, &graph, 52, 20, Some("model-task-abcdefgh"), &[]);
-        let text = layout.lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n");
+        let layout = crate::tui::build_graph_layout(
+            &workspaces,
+            &tasks,
+            &graph,
+            52,
+            20,
+            Some("model-task-abcdefgh"),
+            &[],
+        );
+        let text = layout
+            .lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("root ●") && text.contains("model ●"));
         assert!(text.contains("root-ta") && text.contains("model-ta"));
         assert!(text.contains("◉"));
-        assert!(layout.lines.iter().any(|line| line.kind == crate::tui::GraphLineKind::Selected));
+        assert!(layout
+            .lines
+            .iter()
+            .any(|line| line.kind == crate::tui::GraphLineKind::Selected));
     }
 
     #[test]
@@ -1046,9 +1280,14 @@ mod sched_tests {
         let s = test_sched();
         seed(&s, "c1", "a", "", TaskState::Running);
         s.db.set_terminal("c1", "stub-x").unwrap();
-        s.terminals.lock().unwrap().insert("c1".into(), "stub-x".into());
-        s.hop_since.lock().unwrap()
-            .insert("c1".into(), ("dispatched".into(), std::time::Instant::now()));
+        s.terminals
+            .lock()
+            .unwrap()
+            .insert("c1".into(), "stub-x".into());
+        s.hop_since.lock().unwrap().insert(
+            "c1".into(),
+            ("dispatched".into(), std::time::Instant::now()),
+        );
         on_early_exit(&s, "c1", "swarm_ready timeout").unwrap();
         let t = s.db.get("c1").unwrap().unwrap();
         assert_eq!(t.state, TaskState::Failed);
